@@ -135,13 +135,11 @@ export default function autoSwitcherExtension(pi: ExtensionAPI): void {
 
 				if (output.startsWith("[ROTATED]")) {
 					notify(ctx, `🔄 ${output}`, "info");
-				} else if (output.startsWith("[OK]")) {
+				} else {
 					const message = output.replace(/^\[OK\]\s*/, "").trim();
 					if (message) {
-						notify(ctx, `cpamc-auto-switcher (${source}): [OK] ${message}`, "info");
+						notify(ctx, message, "info");
 					}
-				} else {
-					notify(ctx, `cpamc-auto-switcher: ${output}`, "info");
 				}
 			} catch (err: any) {
 				notify(ctx, `cpamc-auto-switcher unavailable (${source}): ${err?.message || err}`, "warning");

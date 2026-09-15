@@ -251,7 +251,7 @@ func main() {
 			fmt.Printf("[ROTATED] %s\n", res.Reason)
 		}
 	} else {
-		fmt.Printf("[OK] %s\n", res.Reason)
+		fmt.Println(res.Reason)
 	}
 }
 

@@ -400,16 +400,14 @@ func (s *Switcher) RunProvider(ctx context.Context, provider string, dryRun bool
 	// Step 3: Evaluate threshold condition on active account
 	var quotaInfoParts []string
 	if active.Quota.HasFiveHour && active.Quota.WorstFiveHour != nil {
-		quotaInfoParts = append(quotaInfoParts, fmt.Sprintf("5h: %.1f%% rem (%.1f%% used)",
-			active.Quota.WorstFiveHour.RemainingPercentage, active.Quota.WorstFiveHour.ConsumedPercentage))
+		quotaInfoParts = append(quotaInfoParts, fmt.Sprintf("5h %.1f%%", active.Quota.WorstFiveHour.RemainingPercentage))
 	}
 	if active.Quota.HasWeekly && active.Quota.WorstWeekly != nil {
-		quotaInfoParts = append(quotaInfoParts, fmt.Sprintf("weekly: %.1f%% rem (%.1f%% used)",
-			active.Quota.WorstWeekly.RemainingPercentage, active.Quota.WorstWeekly.ConsumedPercentage))
+		quotaInfoParts = append(quotaInfoParts, fmt.Sprintf("weekly %.1f%%", active.Quota.WorstWeekly.RemainingPercentage))
 	}
 	quotaSummaryStr := strings.Join(quotaInfoParts, ", ")
 	if quotaSummaryStr == "" {
-		quotaSummaryStr = fmt.Sprintf("min available: %.1f%%", active.Quota.MinAvailableRemaining())
+		quotaSummaryStr = fmt.Sprintf("%.1f%% remaining", active.Quota.MinAvailableRemaining())
 	}
 
 	shouldRotate, reason := active.Quota.ShouldRotate(s.cfg.FiveHourThreshold, s.cfg.WeeklyThreshold)
@@ -417,7 +415,7 @@ func (s *Switcher) RunProvider(ctx context.Context, provider string, dryRun bool
 		return &SwitchResult{
 			Rotated:       false,
 			ActiveAccount: active.Entry.ID,
-			Reason:        fmt.Sprintf("active account %s within limits [%s] (%s)", active.Entry.ID, quotaSummaryStr, reason),
+			Reason:        quotaSummaryStr,
 		}, nil
 	}
 
@@ -517,7 +515,14 @@ func (s *Switcher) RunProvider(ctx context.Context, provider string, dryRun bool
 func (s *Switcher) Run(ctx context.Context, dryRun bool) (*SwitchResult, error) {
 	providers := s.cfg.ResolvedProviders()
 	if len(providers) == 1 {
-		return s.RunProvider(ctx, providers[0], dryRun)
+		res, err := s.RunProvider(ctx, providers[0], dryRun)
+		if err != nil {
+			return nil, err
+		}
+		if !res.Rotated {
+			res.Reason = fmt.Sprintf("%s: %s", providers[0], res.Reason)
+		}
+		return res, nil
 	}
 
 	type providerOutcome struct {
@@ -560,8 +565,10 @@ func (s *Switcher) Run(ctx context.Context, dryRun bool) (*SwitchResult, error) 
 			anyRotated = true
 			lastActiveAccount = outcome.result.ActiveAccount
 			lastSelectedReserve = outcome.result.SelectedReserve
+			reasons = append(reasons, fmt.Sprintf("%s: %s", p, outcome.result.Reason))
+		} else {
+			reasons = append(reasons, fmt.Sprintf("%s: %s", p, outcome.result.Reason))
 		}
-		reasons = append(reasons, fmt.Sprintf("[%s] %s", p, outcome.result.Reason))
 	}
 
 	return &SwitchResult{
