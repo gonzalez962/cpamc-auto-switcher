@@ -138,3 +138,50 @@ func TestCooldownIntegration(t *testing.T) {
 		t.Fatal("expected 'last_check' key in state file JSON")
 	}
 }
+func TestExtractAccountEmail(t *testing.T) {
+	tests := []struct {
+		id       string
+		name     string
+		email    string
+		expected string
+	}{
+		{
+			id:       "antigravity-userone@example.com.json",
+			name:     "antigravity-userone@example.com.json",
+			email:    "",
+			expected: "userone@example.com",
+		},
+		{
+			id:       "codex-5c0fd0b4-usertwo@example.org-plus.json",
+			name:     "codex-5c0fd0b4-usertwo@example.org-plus.json",
+			email:    "",
+			expected: "usertwo@example.org",
+		},
+		{
+			id:       "codex-6c0ft0b8-userthree@example.net-plus.json",
+			name:     "codex-6c0ft0b8-userthree@example.net-plus.json",
+			email:    "",
+			expected: "userthree@example.net",
+		},
+		{
+			id:       "some-custom-account",
+			name:     "some-name",
+			email:    "direct@example.org",
+			expected: "direct@example.org",
+		},
+		{
+			id:       "no-email-account-id",
+			name:     "no-email-name",
+			email:    "",
+			expected: "no-email-account-id",
+		},
+	}
+
+	for _, tt := range tests {
+		got := extractAccountEmail(tt.id, tt.name, tt.email)
+		if got != tt.expected {
+			t.Errorf("extractAccountEmail(%q, %q, %q) = %q, expected %q",
+				tt.id, tt.name, tt.email, got, tt.expected)
+		}
+	}
+}

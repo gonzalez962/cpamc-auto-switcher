@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -15,6 +16,36 @@ import (
 	"cpamc-auto-switcher/internal/state"
 	"cpamc-auto-switcher/internal/switcher"
 )
+
+var (
+	emailRegex  = regexp.MustCompile(`[a-zA-Z0-9._%+]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`)
+	suffixStrip = regexp.MustCompile(`(?i)(?:-plus)?\.json$`)
+)
+
+func extractAccountEmail(id, name, email string) string {
+	if email != "" && emailRegex.MatchString(email) {
+		cleanEmail := suffixStrip.ReplaceAllString(email, "")
+		if match := emailRegex.FindString(cleanEmail); match != "" {
+			return match
+		}
+	}
+	if id != "" {
+		cleanID := suffixStrip.ReplaceAllString(id, "")
+		if match := emailRegex.FindString(cleanID); match != "" {
+			return match
+		}
+	}
+	if name != "" {
+		cleanName := suffixStrip.ReplaceAllString(name, "")
+		if match := emailRegex.FindString(cleanName); match != "" {
+			return match
+		}
+	}
+	if strings.TrimSpace(id) != "" {
+		return strings.TrimSpace(id)
+	}
+	return strings.TrimSpace(name)
+}
 
 func main() {
 	configPathFlag := flag.String("config", "", "Path to configuration file (default: ~/.local/share/cpamc-auto-switcher/config.json)")
@@ -131,7 +162,7 @@ func main() {
 		}
 
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-		fmt.Fprintln(w, "STATUS\tPROVIDER\tACCOUNT ID\tPREFIX\t5H CONSUMED\tWEEKLY CONSUMED\tMIN AVAILABLE\tDETAILS")
+		fmt.Fprintln(w, "STATUS\tPROVIDER\tACCOUNT ID\tPREFIX\t5H CONSUMED\tWEEKLY CONSUMED\tMIN AVAILABLE")
 
 		for _, acc := range accounts {
 			statusTag := "[RESERVE]"
@@ -147,10 +178,11 @@ func main() {
 			fiveHStr := "N/A"
 			weeklyStr := "N/A"
 			minAvailStr := "N/A"
-			detailsStr := "-"
 
 			if acc.QuotaErr != nil {
-				detailsStr = fmt.Sprintf("Quota error: %v", acc.QuotaErr)
+				fiveHStr = "ERR"
+				weeklyStr = "ERR"
+				minAvailStr = "ERR"
 			} else if acc.Quota != nil {
 				if acc.Quota.HasFiveHour && acc.Quota.WorstFiveHour != nil {
 					fiveHStr = fmt.Sprintf("%.1f%%", acc.Quota.WorstFiveHour.ConsumedPercentage)
@@ -161,15 +193,16 @@ func main() {
 				minAvailStr = fmt.Sprintf("%.1f%%", acc.Quota.MinAvailableRemaining())
 			}
 
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			accountDisplay := extractAccountEmail(acc.Entry.ID, acc.Entry.Name, acc.Entry.Email)
+
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 				statusTag,
 				acc.Entry.Provider,
-				acc.Entry.ID,
+				accountDisplay,
 				acc.Prefix,
 				fiveHStr,
 				weeklyStr,
 				minAvailStr,
-				detailsStr,
 			)
 		}
 		_ = w.Flush()
