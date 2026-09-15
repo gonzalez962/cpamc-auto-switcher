@@ -400,14 +400,14 @@ func (s *Switcher) RunProvider(ctx context.Context, provider string, dryRun bool
 	// Step 3: Evaluate threshold condition on active account
 	var quotaInfoParts []string
 	if active.Quota.HasFiveHour && active.Quota.WorstFiveHour != nil {
-		quotaInfoParts = append(quotaInfoParts, fmt.Sprintf("5h %.1f%%", active.Quota.WorstFiveHour.RemainingPercentage))
+		quotaInfoParts = append(quotaInfoParts, fmt.Sprintf("5h %.1f%%", active.Quota.WorstFiveHour.ConsumedPercentage))
 	}
 	if active.Quota.HasWeekly && active.Quota.WorstWeekly != nil {
-		quotaInfoParts = append(quotaInfoParts, fmt.Sprintf("weekly %.1f%%", active.Quota.WorstWeekly.RemainingPercentage))
+		quotaInfoParts = append(quotaInfoParts, fmt.Sprintf("weekly %.1f%%", active.Quota.WorstWeekly.ConsumedPercentage))
 	}
 	quotaSummaryStr := strings.Join(quotaInfoParts, ", ")
 	if quotaSummaryStr == "" {
-		quotaSummaryStr = fmt.Sprintf("%.1f%% remaining", active.Quota.MinAvailableRemaining())
+		quotaSummaryStr = fmt.Sprintf("%.1f%%", 100.0-active.Quota.MinAvailableRemaining())
 	}
 
 	shouldRotate, reason := active.Quota.ShouldRotate(s.cfg.FiveHourThreshold, s.cfg.WeeklyThreshold)
