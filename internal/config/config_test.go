@@ -53,6 +53,9 @@ func TestConfigSaveAndLoad(t *testing.T) {
 	if loaded.FiveHourThreshold != 90.0 || loaded.WeeklyThreshold != 95.0 {
 		t.Errorf("thresholds mismatch: %f, %f", loaded.FiveHourThreshold, loaded.WeeklyThreshold)
 	}
+	if loaded.CooldownMinutes != DefaultCooldownMinutes {
+		t.Errorf("expected default cooldown %f, got %f", DefaultCooldownMinutes, loaded.CooldownMinutes)
+	}
 }
 
 func TestConfigValidation(t *testing.T) {
@@ -72,5 +75,8 @@ func TestConfigValidation(t *testing.T) {
 	}
 	if cfg.Provider != DefaultProvider || cfg.ActivePrefix != DefaultActivePrefix {
 		t.Errorf("defaults not populated: provider=%s, activePrefix=%s", cfg.Provider, cfg.ActivePrefix)
+	}
+	if cfg.CooldownMinutes != DefaultCooldownMinutes {
+		t.Errorf("expected default cooldown %f, got %f", DefaultCooldownMinutes, cfg.CooldownMinutes)
 	}
 }

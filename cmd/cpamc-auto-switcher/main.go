@@ -12,6 +12,7 @@ import (
 
 	"cpamc-auto-switcher/internal/client"
 	"cpamc-auto-switcher/internal/config"
+	"cpamc-auto-switcher/internal/state"
 	"cpamc-auto-switcher/internal/switcher"
 )
 
@@ -25,6 +26,8 @@ func main() {
 	endpointFlag := flag.String("endpoint", "", "Override API endpoint (e.g. http://localhost:8000)")
 	keyFlag := flag.String("key", "", "Override management key")
 	verboseFlag := flag.Bool("verbose", false, "Enable detailed logging")
+	forceFlag := flag.Bool("force", false, "Bypass cooldown timeout and force quota evaluation immediately")
+	cooldownFlag := flag.Duration("cooldown", 0, "Override cooldown duration between quota checks (e.g. 5m; default: 5m from config)")
 
 	flag.Parse()
 
@@ -76,6 +79,19 @@ func main() {
 	}
 
 	sw := switcher.New(cfg, cli)
+
+	// Load runtime state (tracks last check time for cooldown)
+	statePath, errStatePath := state.DefaultStatePath(loadedPath)
+	var appState *state.State
+	if errStatePath == nil {
+		var errLoadState error
+		appState, errLoadState = state.Load(statePath)
+		if errLoadState != nil && *verboseFlag {
+			fmt.Fprintf(os.Stderr, "[WARN] Could not load state from %s: %v\n", statePath, errLoadState)
+		}
+	} else {
+		appState = &state.State{}
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -153,14 +169,42 @@ func main() {
 			)
 		}
 		_ = w.Flush()
+
+		// Update last check timestamp since quotas were queried
+		if errStatePath == nil {
+			appState.LastCheck = time.Now().UTC()
+			_ = appState.Save(statePath)
+		}
 		return
 	}
 
-	// 6. Handle automatic rotation run / check
+	// 6. Handle automatic rotation run / check with cooldown timeout
+	cooldown := time.Duration(cfg.CooldownMinutes * float64(time.Minute))
+	if *cooldownFlag > 0 {
+		cooldown = *cooldownFlag
+	}
+
+	// If within cooldown timeout and not forced, return nothing and exit cleanly
+	if !*forceFlag && !appState.ShouldCheck(cooldown, time.Now()) {
+		if *verboseFlag {
+			fmt.Printf("[INFO] Cooldown active (last check was %s ago, cooldown is %v); skipping quota check\n",
+				time.Since(appState.LastCheck).Round(time.Second), cooldown)
+		}
+		return
+	}
+
 	res, err := sw.Run(ctx, isDryRun)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Switcher execution failed: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Update last check timestamp on successful check
+	if errStatePath == nil {
+		appState.LastCheck = time.Now().UTC()
+		if errSave := appState.Save(statePath); errSave != nil && *verboseFlag {
+			fmt.Fprintf(os.Stderr, "[WARN] Failed to save state to %s: %v\n", statePath, errSave)
+		}
 	}
 
 	if res.Rotated {

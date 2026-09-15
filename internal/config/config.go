@@ -16,6 +16,7 @@ const (
 	DefaultReservePrefixPrefix = "agy_"
 	DefaultFiveHourThreshold   = 90.0
 	DefaultWeeklyThreshold     = 95.0
+	DefaultCooldownMinutes     = 5.0
 )
 
 // Config holds runtime configuration for cpamc-auto-switcher.
@@ -27,6 +28,7 @@ type Config struct {
 	ReservePrefixPrefix string  `json:"reserve_prefix_prefix"`
 	FiveHourThreshold   float64 `json:"five_hour_threshold"`
 	WeeklyThreshold     float64 `json:"weekly_threshold"`
+	CooldownMinutes     float64 `json:"cooldown_minutes,omitempty"`
 }
 
 // DefaultConfigPath returns ~/.local/share/cpamc-auto-switcher/config.json.
@@ -46,6 +48,7 @@ func NewDefaultConfig() *Config {
 		ReservePrefixPrefix: DefaultReservePrefixPrefix,
 		FiveHourThreshold:   DefaultFiveHourThreshold,
 		WeeklyThreshold:     DefaultWeeklyThreshold,
+		CooldownMinutes:     DefaultCooldownMinutes,
 	}
 }
 
@@ -132,6 +135,9 @@ func (c *Config) Validate() error {
 	}
 	if c.WeeklyThreshold <= 0 || c.WeeklyThreshold > 100 {
 		c.WeeklyThreshold = DefaultWeeklyThreshold
+	}
+	if c.CooldownMinutes <= 0 {
+		c.CooldownMinutes = DefaultCooldownMinutes
 	}
 	return nil
 }

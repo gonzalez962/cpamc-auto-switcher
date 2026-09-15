@@ -91,14 +91,28 @@ cpamc-auto-switcher -dry-run
 ```
 
 ### Perform Automatic Rotation
-Inspect accounts, fetch live quotas, and perform a prefix swap if limits are exceeded:
+Inspect accounts, fetch live quotas, and perform a prefix swap if limits are exceeded. A 5-minute cooldown is enforced between quota checks by default to prevent repetitive CLI queries. If invoked within the cooldown window, the command outputs nothing and exits with 0:
 
 ```bash
 cpamc-auto-switcher
 ```
 
+### Force Immediate Check (Bypass Cooldown)
+Bypass the cooldown period and query limits immediately:
+
+```bash
+cpamc-auto-switcher -force
+```
+
+### Custom Cooldown Duration
+Specify a custom cooldown interval (e.g. 1m, 10m):
+
+```bash
+cpamc-auto-switcher -cooldown 10m
+```
+
 ### Verbose Mode
-Display detailed evaluation logs:
+Display detailed evaluation logs (including remaining cooldown time if active):
 
 ```bash
 cpamc-auto-switcher -verbose

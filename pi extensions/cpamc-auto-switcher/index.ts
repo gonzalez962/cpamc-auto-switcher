@@ -123,6 +123,11 @@ export default function autoSwitcherExtension(pi: ExtensionAPI): void {
 				const result = await runAutoSwitcher(ctx?.signal);
 				const output = (result.stdout || result.stderr).trim();
 
+				// If CLI returned no output (e.g. within cooldown timeout), do not show any notification
+				if (!output) {
+					return;
+				}
+
 				if (result.code !== 0) {
 					notify(ctx, `cpamc-auto-switcher: error after ${source}: ${output}`, "warning");
 					return;
@@ -131,8 +136,11 @@ export default function autoSwitcherExtension(pi: ExtensionAPI): void {
 				if (output.startsWith("[ROTATED]")) {
 					notify(ctx, `🔄 ${output}`, "info");
 				} else if (output.startsWith("[OK]")) {
-					notify(ctx, `cpamc-auto-switcher (${source}): ${output}`, "info");
-				} else if (output) {
+					const message = output.replace(/^\[OK\]\s*/, "").trim();
+					if (message) {
+						notify(ctx, `cpamc-auto-switcher (${source}): [OK] ${message}`, "info");
+					}
+				} else {
 					notify(ctx, `cpamc-auto-switcher: ${output}`, "info");
 				}
 			} catch (err: any) {
