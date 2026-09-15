@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"cpamc-auto-switcher/internal/client"
 	"cpamc-auto-switcher/internal/config"
@@ -304,4 +305,92 @@ func TestCodexSwitcherWorkflow(t *testing.T) {
 		t.Errorf("unexpected prefixes after manual switch: %+v", prefixes)
 	}
 	mu.Unlock()
+}
+
+func TestConcurrentQuotaFetchingAndDecision(t *testing.T) {
+	var inFlight int32
+	var maxConcurrent int32
+	var mu sync.Mutex
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v0/management/auth-files":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"files": []map[string]any{
+					{"id": "c1", "name": "c1.json", "auth_index": "idx-1", "provider": "codex"},
+					{"id": "c2", "name": "c2.json", "auth_index": "idx-2", "provider": "codex"},
+					{"id": "c3", "name": "c3.json", "auth_index": "idx-3", "provider": "codex"},
+				},
+			})
+		case "/v0/management/auth-files/download":
+			name := r.URL.Query().Get("name")
+			p := "codex_1"
+			if name == "c1.json" {
+				p = "codex"
+			} else if name == "c3.json" {
+				p = "codex_2"
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"prefix": p})
+		case "/v0/management/api-call":
+			mu.Lock()
+			inFlight++
+			if inFlight > maxConcurrent {
+				maxConcurrent = inFlight
+			}
+			mu.Unlock()
+
+			// Artificially simulate non-instantaneous API response
+			time.Sleep(20 * time.Millisecond)
+
+			mu.Lock()
+			inFlight--
+			mu.Unlock()
+
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"rate_limit": {
+					"allowed": true,
+					"primary_window": {"used_percent": 10.0},
+					"secondary_window": {"used_percent": 20.0}
+				}
+			}`))
+		case "/v0/management/auth-files/fields":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		}
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		Endpoint:            server.URL,
+		ManagementKey:       "dummy",
+		Provider:            "codex",
+		FiveHourThreshold:   90.0,
+		WeeklyThreshold:     95.0,
+	}
+
+	cli, err := client.New(cfg.Endpoint, cfg.ManagementKey)
+	if err != nil {
+		t.Fatalf("client.New failed: %v", err)
+	}
+	sw := New(cfg, cli)
+
+	// ListAccounts should fetch accounts concurrently
+	accounts, err := sw.ListAccounts(context.Background())
+	if err != nil {
+		t.Fatalf("ListAccounts failed: %v", err)
+	}
+	if len(accounts) != 3 {
+		t.Fatalf("expected 3 accounts, got %d", len(accounts))
+	}
+
+	mu.Lock()
+	concurrentObserved := maxConcurrent
+	mu.Unlock()
+
+	if concurrentObserved < 2 {
+		t.Errorf("expected concurrent requests > 1, got %d", concurrentObserved)
+	}
 }

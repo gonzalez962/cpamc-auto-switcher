@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
 	"cpamc-auto-switcher/internal/client"
 	"cpamc-auto-switcher/internal/config"
@@ -44,68 +45,131 @@ func New(cfg *config.Config, cli *client.Client) *Switcher {
 	}
 }
 
-// ListAccounts retrieves and evaluates all accounts for the configured provider(s) along with their quota.
-func (s *Switcher) ListAccounts(ctx context.Context) ([]AccountState, error) {
+// fetchAccountsConcurrently loads account metadata and quotas in parallel.
+// It guarantees that all asynchronous API calls finish before returning.
+func (s *Switcher) fetchAccountsConcurrently(ctx context.Context, targetProviders []string, skipDisabled bool) ([]AccountState, error) {
 	files, err := s.client.ListAuthFiles(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list auth files: %w", err)
 	}
 
-	targetProviders := s.cfg.ResolvedProviders()
 	providerSet := make(map[string]bool)
 	for _, p := range targetProviders {
-		providerSet[strings.ToLower(p)] = true
+		providerSet[strings.ToLower(strings.TrimSpace(p))] = true
 	}
 
-	var accounts []AccountState
-
+	var matchingFiles []client.AuthFileEntry
 	for _, f := range files {
 		fProvider := strings.ToLower(strings.TrimSpace(f.Provider))
 		if !providerSet[fProvider] {
 			continue
 		}
-
-		name := f.Name
-		if name == "" {
-			name = f.ID
+		if skipDisabled && f.Disabled {
+			continue
 		}
+		matchingFiles = append(matchingFiles, f)
+	}
 
-		meta, errMeta := s.client.GetAuthFileDetails(ctx, name)
-		if errMeta != nil {
-			return nil, fmt.Errorf("read metadata for %s: %w", name, errMeta)
-		}
+	if len(matchingFiles) == 0 {
+		return nil, nil
+	}
 
-		activePrefix, reservePrefix := s.cfg.ConventionForProvider(f.Provider)
+	results := make([]AccountState, len(matchingFiles))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstFatalErr error
 
-		state := AccountState{
-			Entry:            f,
-			Prefix:           meta.Prefix,
-			ChatGPTAccountID: meta.ChatGPTAccountID,
-			IsActive:         meta.Prefix == activePrefix,
-			IsReserve:        strings.HasPrefix(meta.Prefix, reservePrefix),
-		}
+	// Concurrency limiter to avoid exhausting sockets or overloading proxies
+	concurrencyLimit := 10
+	if len(matchingFiles) < concurrencyLimit {
+		concurrencyLimit = len(matchingFiles)
+	}
+	sem := make(chan struct{}, concurrencyLimit)
 
-		// Fetch quota summary if not disabled
-		if !f.Disabled {
-			accountOrProjectID := f.ProjectID
-			if strings.EqualFold(f.Provider, "codex") && meta.ChatGPTAccountID != "" {
-				accountOrProjectID = meta.ChatGPTAccountID
+	for i := range matchingFiles {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				mu.Lock()
+				if firstFatalErr == nil {
+					firstFatalErr = ctx.Err()
+				}
+				mu.Unlock()
+				return
 			}
 
-			qBytes, errQuota := s.client.GetQuotaSummaryForProvider(ctx, f.Provider, f.AuthIndex, accountOrProjectID)
-			if errQuota != nil {
-				state.QuotaErr = errQuota
-			} else {
-				parsedQuota, errParse := quota.ParseQuotaSummaryForProvider(f.Provider, qBytes)
-				if errParse != nil {
-					state.QuotaErr = errParse
+			f := matchingFiles[idx]
+			name := f.Name
+			if name == "" {
+				name = f.ID
+			}
+
+			meta, errMeta := s.client.GetAuthFileDetails(ctx, name)
+			if errMeta != nil {
+				mu.Lock()
+				if firstFatalErr == nil {
+					firstFatalErr = fmt.Errorf("read metadata for %s: %w", name, errMeta)
+				}
+				mu.Unlock()
+				return
+			}
+
+			activePrefix, reservePrefix := s.cfg.ConventionForProvider(f.Provider)
+
+			state := AccountState{
+				Entry:            f,
+				Prefix:           meta.Prefix,
+				ChatGPTAccountID: meta.ChatGPTAccountID,
+				IsActive:         meta.Prefix == activePrefix,
+				IsReserve:        strings.HasPrefix(meta.Prefix, reservePrefix),
+			}
+
+			// Fetch quota asynchronously if not disabled
+			if !f.Disabled {
+				accountOrProjectID := f.ProjectID
+				if strings.EqualFold(f.Provider, "codex") && meta.ChatGPTAccountID != "" {
+					accountOrProjectID = meta.ChatGPTAccountID
+				}
+
+				qBytes, errQuota := s.client.GetQuotaSummaryForProvider(ctx, f.Provider, f.AuthIndex, accountOrProjectID)
+				if errQuota != nil {
+					state.QuotaErr = errQuota
 				} else {
-					state.Quota = parsedQuota
+					parsedQuota, errParse := quota.ParseQuotaSummaryForProvider(f.Provider, qBytes)
+					if errParse != nil {
+						state.QuotaErr = errParse
+					} else {
+						state.Quota = parsedQuota
+					}
 				}
 			}
-		}
 
-		accounts = append(accounts, state)
+			mu.Lock()
+			results[idx] = state
+			mu.Unlock()
+		}(i)
+	}
+
+	// Wait until ALL accounts and quotas have finished loading
+	wg.Wait()
+
+	if firstFatalErr != nil {
+		return nil, firstFatalErr
+	}
+
+	return results, nil
+}
+
+// ListAccounts retrieves and evaluates all accounts for the configured provider(s) along with their quota.
+func (s *Switcher) ListAccounts(ctx context.Context) ([]AccountState, error) {
+	accounts, err := s.fetchAccountsConcurrently(ctx, s.cfg.ResolvedProviders(), false)
+	if err != nil {
+		return nil, err
 	}
 
 	// Sort accounts: provider alphabetically, active first, then by prefix alphabetically, then by ID
@@ -141,26 +205,61 @@ func (s *Switcher) SwitchToAccount(ctx context.Context, targetAccount string, dr
 		entry client.AuthFileEntry
 		meta  client.AuthFileMetadata
 	}
-	var loadedFiles []fileWithMeta
+	loadedFiles := make([]fileWithMeta, len(files))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+
+	sem := make(chan struct{}, 10)
+	for i := range files {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = ctx.Err()
+				}
+				mu.Unlock()
+				return
+			}
+
+			f := files[idx]
+			name := f.Name
+			if name == "" {
+				name = f.ID
+			}
+
+			meta, errMeta := s.client.GetAuthFileDetails(ctx, name)
+			if errMeta != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("read metadata for %s: %w", name, errMeta)
+				}
+				mu.Unlock()
+				return
+			}
+
+			mu.Lock()
+			loadedFiles[idx] = fileWithMeta{entry: f, meta: meta}
+			mu.Unlock()
+		}(i)
+	}
+	wg.Wait()
+
+	if firstErr != nil {
+		return nil, firstErr
+	}
+
 	var targetItem *fileWithMeta
-
-	for _, f := range files {
-		name := f.Name
-		if name == "" {
-			name = f.ID
-		}
-
-		meta, errMeta := s.client.GetAuthFileDetails(ctx, name)
-		if errMeta != nil {
-			return nil, fmt.Errorf("read metadata for %s: %w", name, errMeta)
-		}
-
-		item := fileWithMeta{entry: f, meta: meta}
-		loadedFiles = append(loadedFiles, item)
-
-		// Match target by Prefix, ID, Name, or Email
-		if strings.EqualFold(meta.Prefix, target) || strings.EqualFold(f.ID, target) || strings.EqualFold(f.Name, target) || strings.EqualFold(f.Email, target) {
-			targetItem = &item
+	for i := range loadedFiles {
+		item := &loadedFiles[i]
+		if strings.EqualFold(item.meta.Prefix, target) || strings.EqualFold(item.entry.ID, target) || strings.EqualFold(item.entry.Name, target) || strings.EqualFold(item.entry.Email, target) {
+			targetItem = item
+			break
 		}
 	}
 
@@ -203,7 +302,6 @@ func (s *Switcher) SwitchToAccount(ctx context.Context, targetAccount string, dr
 	// Determine new reserve prefix for the demoted active account
 	newReservePrefix := targetItem.meta.Prefix
 	if !strings.HasPrefix(newReservePrefix, reservePrefixPrefix) {
-		// Target was not a reserve (e.g. had another prefix or none); find first free sequence index
 		nextIdx := 1
 		for existingReserveIndices[nextIdx] {
 			nextIdx++
@@ -237,7 +335,6 @@ func (s *Switcher) SwitchToAccount(ctx context.Context, targetAccount string, dr
 			nameActive = activeItem.entry.ID
 		}
 		if err := s.client.PatchAuthPrefix(ctx, nameActive, newReservePrefix); err != nil {
-			// Rollback target back to its original prefix
 			_ = s.client.PatchAuthPrefix(ctx, nameTarget, targetItem.meta.Prefix)
 			return nil, fmt.Errorf("failed to demote active account %s to %q: %w (rollback attempted)", nameActive, newReservePrefix, err)
 		}
@@ -252,43 +349,14 @@ func (s *Switcher) SwitchToAccount(ctx context.Context, targetAccount string, dr
 	}, nil
 }
 
-// RunProvider evaluates and rotates a single provider.
+// RunProvider evaluates and rotates a single provider after ALL accounts' quotas have finished loading asynchronously.
 func (s *Switcher) RunProvider(ctx context.Context, provider string, dryRun bool) (*SwitchResult, error) {
-	files, err := s.client.ListAuthFiles(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("list auth files: %w", err)
-	}
-
 	activePrefix, reservePrefixPrefix := s.cfg.ConventionForProvider(provider)
-	var providerAccounts []AccountState
 
-	// 1. Filter by provider and resolve prefixes
-	for _, f := range files {
-		if !strings.EqualFold(strings.TrimSpace(f.Provider), strings.TrimSpace(provider)) {
-			continue
-		}
-		if f.Disabled {
-			continue
-		}
-
-		name := f.Name
-		if name == "" {
-			name = f.ID
-		}
-
-		meta, errMeta := s.client.GetAuthFileDetails(ctx, name)
-		if errMeta != nil {
-			return nil, fmt.Errorf("read metadata for %s: %w", name, errMeta)
-		}
-
-		state := AccountState{
-			Entry:            f,
-			Prefix:           meta.Prefix,
-			ChatGPTAccountID: meta.ChatGPTAccountID,
-			IsActive:         meta.Prefix == activePrefix,
-			IsReserve:        strings.HasPrefix(meta.Prefix, reservePrefixPrefix),
-		}
-		providerAccounts = append(providerAccounts, state)
+	// Step 1: Concurrently load all account metadata and quotas for this provider
+	providerAccounts, err := s.fetchAccountsConcurrently(ctx, []string{provider}, true)
+	if err != nil {
+		return nil, fmt.Errorf("fetch accounts for %s: %w", provider, err)
 	}
 
 	if len(providerAccounts) == 0 {
@@ -298,7 +366,7 @@ func (s *Switcher) RunProvider(ctx context.Context, provider string, dryRun bool
 		}, nil
 	}
 
-	// 2. Identify active account
+	// Step 2: Identify active account and reserve accounts
 	var active *AccountState
 	var reserves []*AccountState
 
@@ -322,39 +390,29 @@ func (s *Switcher) RunProvider(ctx context.Context, provider string, dryRun bool
 		}, nil
 	}
 
-	// 3. Fetch quota for active account
-	accountOrProjectID := active.Entry.ProjectID
-	if strings.EqualFold(provider, "codex") && active.ChatGPTAccountID != "" {
-		accountOrProjectID = active.ChatGPTAccountID
+	if active.QuotaErr != nil {
+		return nil, fmt.Errorf("active account quota check failed (%s, %s): %w", provider, active.Entry.ID, active.QuotaErr)
+	}
+	if active.Quota == nil {
+		return nil, fmt.Errorf("active account quota missing (%s, %s)", provider, active.Entry.ID)
 	}
 
-	quotaBytes, errQuota := s.client.GetQuotaSummaryForProvider(ctx, provider, active.Entry.AuthIndex, accountOrProjectID)
-	if errQuota != nil {
-		return nil, fmt.Errorf("fetch active account quota (%s, %s): %w", provider, active.Entry.ID, errQuota)
-	}
-
-	activeQuota, errParse := quota.ParseQuotaSummaryForProvider(provider, quotaBytes)
-	if errParse != nil {
-		return nil, fmt.Errorf("parse active account quota (%s, %s): %w", provider, active.Entry.ID, errParse)
-	}
-	active.Quota = activeQuota
-
-	// 4. Evaluate threshold condition
+	// Step 3: Evaluate threshold condition on active account
 	var quotaInfoParts []string
-	if activeQuota.HasFiveHour && activeQuota.WorstFiveHour != nil {
+	if active.Quota.HasFiveHour && active.Quota.WorstFiveHour != nil {
 		quotaInfoParts = append(quotaInfoParts, fmt.Sprintf("5h: %.1f%% rem (%.1f%% used)",
-			activeQuota.WorstFiveHour.RemainingPercentage, activeQuota.WorstFiveHour.ConsumedPercentage))
+			active.Quota.WorstFiveHour.RemainingPercentage, active.Quota.WorstFiveHour.ConsumedPercentage))
 	}
-	if activeQuota.HasWeekly && activeQuota.WorstWeekly != nil {
+	if active.Quota.HasWeekly && active.Quota.WorstWeekly != nil {
 		quotaInfoParts = append(quotaInfoParts, fmt.Sprintf("weekly: %.1f%% rem (%.1f%% used)",
-			activeQuota.WorstWeekly.RemainingPercentage, activeQuota.WorstWeekly.ConsumedPercentage))
+			active.Quota.WorstWeekly.RemainingPercentage, active.Quota.WorstWeekly.ConsumedPercentage))
 	}
 	quotaSummaryStr := strings.Join(quotaInfoParts, ", ")
 	if quotaSummaryStr == "" {
-		quotaSummaryStr = fmt.Sprintf("min available: %.1f%%", activeQuota.MinAvailableRemaining())
+		quotaSummaryStr = fmt.Sprintf("min available: %.1f%%", active.Quota.MinAvailableRemaining())
 	}
 
-	shouldRotate, reason := activeQuota.ShouldRotate(s.cfg.FiveHourThreshold, s.cfg.WeeklyThreshold)
+	shouldRotate, reason := active.Quota.ShouldRotate(s.cfg.FiveHourThreshold, s.cfg.WeeklyThreshold)
 	if !shouldRotate {
 		return &SwitchResult{
 			Rotated:       false,
@@ -371,7 +429,7 @@ func (s *Switcher) RunProvider(ctx context.Context, provider string, dryRun bool
 		}, nil
 	}
 
-	// 5. Fetch and evaluate quota for all reserve accounts
+	// Step 4: Evaluate reserve candidates (all quotas are ALREADY loaded in memory)
 	type candidate struct {
 		account   *AccountState
 		minRemain float64
@@ -379,31 +437,18 @@ func (s *Switcher) RunProvider(ctx context.Context, provider string, dryRun bool
 	var eligible []candidate
 
 	for _, res := range reserves {
-		resAccountOrProjectID := res.Entry.ProjectID
-		if strings.EqualFold(provider, "codex") && res.ChatGPTAccountID != "" {
-			resAccountOrProjectID = res.ChatGPTAccountID
-		}
-
-		qBytes, err := s.client.GetQuotaSummaryForProvider(ctx, provider, res.Entry.AuthIndex, resAccountOrProjectID)
-		if err != nil {
-			res.QuotaErr = err
+		if res.QuotaErr != nil || res.Quota == nil {
+			// Skip reserves with quota errors
 			continue
 		}
-
-		parsed, err := quota.ParseQuotaSummaryForProvider(provider, qBytes)
-		if err != nil {
-			res.QuotaErr = err
-			continue
-		}
-		res.Quota = parsed
 
 		// Candidate must not be already in breach of thresholds
-		exceeded, _ := parsed.ShouldRotate(s.cfg.FiveHourThreshold, s.cfg.WeeklyThreshold)
+		exceeded, _ := res.Quota.ShouldRotate(s.cfg.FiveHourThreshold, s.cfg.WeeklyThreshold)
 		if exceeded {
 			continue
 		}
 
-		minRem := parsed.MinAvailableRemaining()
+		minRem := res.Quota.MinAvailableRemaining()
 		eligible = append(eligible, candidate{
 			account:   res,
 			minRemain: minRem,
@@ -418,7 +463,7 @@ func (s *Switcher) RunProvider(ctx context.Context, provider string, dryRun bool
 		}, nil
 	}
 
-	// 6. Rank candidates by highest minimum available remaining quota (Policy 3B)
+	// Step 5: Rank candidates by highest minimum available remaining quota (Policy 3B)
 	sort.Slice(eligible, func(i, j int) bool {
 		if eligible[i].minRemain != eligible[j].minRemain {
 			return eligible[i].minRemain > eligible[j].minRemain
@@ -439,13 +484,13 @@ func (s *Switcher) RunProvider(ctx context.Context, provider string, dryRun bool
 		}, nil
 	}
 
-	// 7. Execute 2-step direct swap (Policy 4A)
+	// Step 6: Execute 2-step direct swap (Policy 4A)
 	nameReserve := bestReserve.Entry.Name
 	if nameReserve == "" {
 		nameReserve = bestReserve.Entry.ID
 	}
 	if err := s.client.PatchAuthPrefix(ctx, nameReserve, activePrefix); err != nil {
-		return nil, fmt.Errorf("failed to promote reserve account %s to active prefix %q: %w", nameReserve, activePrefix, err)
+		return nil, fmt.Errorf("failed to promote reserve %s to %q: %w", nameReserve, activePrefix, err)
 	}
 
 	nameActive := active.Entry.Name
@@ -454,7 +499,7 @@ func (s *Switcher) RunProvider(ctx context.Context, provider string, dryRun bool
 	}
 	if err := s.client.PatchAuthPrefix(ctx, nameActive, reserveOriginalPrefix); err != nil {
 		_ = s.client.PatchAuthPrefix(ctx, nameReserve, reserveOriginalPrefix)
-		return nil, fmt.Errorf("failed to demote previous active account %s to %q: %w (rollback attempted)", nameActive, reserveOriginalPrefix, err)
+		return nil, fmt.Errorf("failed to demote active %s to %q: %w (rollback attempted)", nameActive, reserveOriginalPrefix, err)
 	}
 
 	return &SwitchResult{
@@ -468,11 +513,40 @@ func (s *Switcher) RunProvider(ctx context.Context, provider string, dryRun bool
 	}, nil
 }
 
-// Run executes the evaluation and switching workflow across all resolved providers.
+// Run executes the evaluation and switching workflow across all resolved providers asynchronously.
 func (s *Switcher) Run(ctx context.Context, dryRun bool) (*SwitchResult, error) {
 	providers := s.cfg.ResolvedProviders()
 	if len(providers) == 1 {
 		return s.RunProvider(ctx, providers[0], dryRun)
+	}
+
+	type providerOutcome struct {
+		provider string
+		result   *SwitchResult
+		err      error
+	}
+
+	outcomesChan := make(chan providerOutcome, len(providers))
+	var wg sync.WaitGroup
+
+	for _, p := range providers {
+		wg.Add(1)
+		go func(prov string) {
+			defer wg.Done()
+			res, err := s.RunProvider(ctx, prov, dryRun)
+			outcomesChan <- providerOutcome{provider: prov, result: res, err: err}
+		}(p)
+	}
+
+	wg.Wait()
+	close(outcomesChan)
+
+	outcomeMap := make(map[string]providerOutcome)
+	for outcome := range outcomesChan {
+		if outcome.err != nil {
+			return nil, fmt.Errorf("provider %s rotation failed: %w", outcome.provider, outcome.err)
+		}
+		outcomeMap[outcome.provider] = outcome
 	}
 
 	var anyRotated bool
@@ -481,16 +555,13 @@ func (s *Switcher) Run(ctx context.Context, dryRun bool) (*SwitchResult, error) 
 	var lastSelectedReserve string
 
 	for _, p := range providers {
-		res, err := s.RunProvider(ctx, p, dryRun)
-		if err != nil {
-			return nil, fmt.Errorf("provider %s rotation failed: %w", p, err)
-		}
-		if res.Rotated {
+		outcome := outcomeMap[p]
+		if outcome.result.Rotated {
 			anyRotated = true
-			lastActiveAccount = res.ActiveAccount
-			lastSelectedReserve = res.SelectedReserve
+			lastActiveAccount = outcome.result.ActiveAccount
+			lastSelectedReserve = outcome.result.SelectedReserve
 		}
-		reasons = append(reasons, fmt.Sprintf("[%s] %s", p, res.Reason))
+		reasons = append(reasons, fmt.Sprintf("[%s] %s", p, outcome.result.Reason))
 	}
 
 	return &SwitchResult{
