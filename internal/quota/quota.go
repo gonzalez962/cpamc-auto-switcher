@@ -128,6 +128,129 @@ func ParseQuotaSummary(raw []byte) (*AccountQuota, error) {
 	return result, nil
 }
 
+// ParseQuotaSummaryForProvider parses quota JSON based on the target provider ("antigravity" or "codex").
+func ParseQuotaSummaryForProvider(provider string, raw []byte) (*AccountQuota, error) {
+	if strings.EqualFold(strings.TrimSpace(provider), "codex") {
+		return ParseCodexQuotaSummary(raw)
+	}
+	return ParseQuotaSummary(raw)
+}
+
+// CodexWindow represents a rate limit window in Codex.
+type CodexWindow struct {
+	UsedPercent        *float64 `json:"used_percent"`
+	LimitWindowSeconds *int64   `json:"limit_window_seconds"`
+	ResetAfterSeconds  *int64   `json:"reset_after_seconds"`
+	ResetAt            *int64   `json:"reset_at"`
+}
+
+// CodexRateLimit holds rate limit state and windows.
+type CodexRateLimit struct {
+	Allowed         *bool        `json:"allowed"`
+	LimitReached    *bool        `json:"limit_reached"`
+	PrimaryWindow   *CodexWindow `json:"primary_window"`
+	SecondaryWindow *CodexWindow `json:"secondary_window"`
+}
+
+type codexUsageResponse struct {
+	RateLimit           *CodexRateLimit `json:"rate_limit"`
+	CodeReviewRateLimit *CodexRateLimit `json:"code_review_rate_limit"`
+	PlanType            string          `json:"plan_type"`
+}
+
+func evalCodexWindow(win *CodexWindow, defaultName string, wType QuotaWindow, limitReached, allowedFalse bool) *EvaluatedBucket {
+	if win == nil && !limitReached && !allowedFalse {
+		return nil
+	}
+
+	consumed := 0.0
+	hasData := false
+	if win != nil && win.UsedPercent != nil {
+		consumed = *win.UsedPercent
+		hasData = true
+	}
+
+	if limitReached || allowedFalse {
+		consumed = 100.0
+		hasData = true
+	}
+
+	if !hasData {
+		return nil
+	}
+
+	if consumed < 0.0 {
+		consumed = 0.0
+	}
+	if consumed > 100.0 {
+		consumed = 100.0
+	}
+	remaining := 100.0 - consumed
+
+	resetTime := ""
+	if win != nil && win.ResetAt != nil && *win.ResetAt > 0 {
+		resetTime = fmt.Sprintf("%d", *win.ResetAt)
+	}
+
+	return &EvaluatedBucket{
+		Window:              wType,
+		DisplayName:         defaultName,
+		RemainingPercentage: remaining,
+		ConsumedPercentage:  consumed,
+		ResetTime:           resetTime,
+	}
+}
+
+// ParseCodexQuotaSummary decodes Codex /backend-api/wham/usage JSON and calculates
+// evaluated 5-hour and weekly limits.
+func ParseCodexQuotaSummary(raw []byte) (*AccountQuota, error) {
+	var resp codexUsageResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("unmarshal codex usage response: %w", err)
+	}
+
+	result := &AccountQuota{}
+
+	if resp.RateLimit != nil {
+		rl := resp.RateLimit
+		limitReached := rl.LimitReached != nil && *rl.LimitReached
+		allowedFalse := rl.Allowed != nil && !*rl.Allowed
+
+		if pBucket := evalCodexWindow(rl.PrimaryWindow, "5-Hour Limit", WindowFiveHour, limitReached, allowedFalse); pBucket != nil {
+			result.HasFiveHour = true
+			result.WorstFiveHour = pBucket
+		}
+
+		if sBucket := evalCodexWindow(rl.SecondaryWindow, "Weekly Limit", WindowWeekly, limitReached, allowedFalse); sBucket != nil {
+			result.HasWeekly = true
+			result.WorstWeekly = sBucket
+		}
+	}
+
+	// Also check code_review_rate_limit if present (taking worst case across groups)
+	if resp.CodeReviewRateLimit != nil {
+		cr := resp.CodeReviewRateLimit
+		limitReached := cr.LimitReached != nil && *cr.LimitReached
+		allowedFalse := cr.Allowed != nil && !*cr.Allowed
+
+		if pBucket := evalCodexWindow(cr.PrimaryWindow, "Code Review 5h Limit", WindowFiveHour, limitReached, allowedFalse); pBucket != nil {
+			result.HasFiveHour = true
+			if result.WorstFiveHour == nil || pBucket.ConsumedPercentage > result.WorstFiveHour.ConsumedPercentage {
+				result.WorstFiveHour = pBucket
+			}
+		}
+
+		if sBucket := evalCodexWindow(cr.SecondaryWindow, "Code Review Weekly Limit", WindowWeekly, limitReached, allowedFalse); sBucket != nil {
+			result.HasWeekly = true
+			if result.WorstWeekly == nil || sBucket.ConsumedPercentage > result.WorstWeekly.ConsumedPercentage {
+				result.WorstWeekly = sBucket
+			}
+		}
+	}
+
+	return result, nil
+}
+
 // ShouldRotate evaluates rotation conditions:
 // - 5h consumed >= fiveHourThreshold OR weekly consumed >= weeklyThreshold
 // - Policy 1A: If 5h window is absent, evaluate only weekly.

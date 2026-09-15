@@ -13,12 +13,13 @@ import (
 
 // AccountState represents a discovered credential and its quota metrics.
 type AccountState struct {
-	Entry     client.AuthFileEntry
-	Prefix    string
-	Quota     *quota.AccountQuota
-	QuotaErr  error
-	IsActive  bool
-	IsReserve bool
+	Entry            client.AuthFileEntry
+	Prefix           string
+	ChatGPTAccountID string
+	Quota            *quota.AccountQuota
+	QuotaErr         error
+	IsActive         bool
+	IsReserve        bool
 }
 
 // SwitchResult summarizes execution output.
@@ -43,17 +44,24 @@ func New(cfg *config.Config, cli *client.Client) *Switcher {
 	}
 }
 
-// ListAccounts retrieves and evaluates all accounts for the configured provider along with their quota.
+// ListAccounts retrieves and evaluates all accounts for the configured provider(s) along with their quota.
 func (s *Switcher) ListAccounts(ctx context.Context) ([]AccountState, error) {
 	files, err := s.client.ListAuthFiles(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list auth files: %w", err)
 	}
 
+	targetProviders := s.cfg.ResolvedProviders()
+	providerSet := make(map[string]bool)
+	for _, p := range targetProviders {
+		providerSet[strings.ToLower(p)] = true
+	}
+
 	var accounts []AccountState
 
 	for _, f := range files {
-		if !strings.EqualFold(strings.TrimSpace(f.Provider), strings.TrimSpace(s.cfg.Provider)) {
+		fProvider := strings.ToLower(strings.TrimSpace(f.Provider))
+		if !providerSet[fProvider] {
 			continue
 		}
 
@@ -62,25 +70,33 @@ func (s *Switcher) ListAccounts(ctx context.Context) ([]AccountState, error) {
 			name = f.ID
 		}
 
-		prefix, errPrefix := s.client.GetAuthFilePrefix(ctx, name)
-		if errPrefix != nil {
-			return nil, fmt.Errorf("read prefix for %s: %w", name, errPrefix)
+		meta, errMeta := s.client.GetAuthFileDetails(ctx, name)
+		if errMeta != nil {
+			return nil, fmt.Errorf("read metadata for %s: %w", name, errMeta)
 		}
 
+		activePrefix, reservePrefix := s.cfg.ConventionForProvider(f.Provider)
+
 		state := AccountState{
-			Entry:     f,
-			Prefix:    prefix,
-			IsActive:  prefix == s.cfg.ActivePrefix,
-			IsReserve: strings.HasPrefix(prefix, s.cfg.ReservePrefixPrefix),
+			Entry:            f,
+			Prefix:           meta.Prefix,
+			ChatGPTAccountID: meta.ChatGPTAccountID,
+			IsActive:         meta.Prefix == activePrefix,
+			IsReserve:        strings.HasPrefix(meta.Prefix, reservePrefix),
 		}
 
 		// Fetch quota summary if not disabled
 		if !f.Disabled {
-			qBytes, errQuota := s.client.GetQuotaSummary(ctx, f.AuthIndex, f.ProjectID)
+			accountOrProjectID := f.ProjectID
+			if strings.EqualFold(f.Provider, "codex") && meta.ChatGPTAccountID != "" {
+				accountOrProjectID = meta.ChatGPTAccountID
+			}
+
+			qBytes, errQuota := s.client.GetQuotaSummaryForProvider(ctx, f.Provider, f.AuthIndex, accountOrProjectID)
 			if errQuota != nil {
 				state.QuotaErr = errQuota
 			} else {
-				parsedQuota, errParse := quota.ParseQuotaSummary(qBytes)
+				parsedQuota, errParse := quota.ParseQuotaSummaryForProvider(f.Provider, qBytes)
 				if errParse != nil {
 					state.QuotaErr = errParse
 				} else {
@@ -92,8 +108,11 @@ func (s *Switcher) ListAccounts(ctx context.Context) ([]AccountState, error) {
 		accounts = append(accounts, state)
 	}
 
-	// Sort accounts: active first, then by prefix alphabetically, then by ID
+	// Sort accounts: provider alphabetically, active first, then by prefix alphabetically, then by ID
 	sort.Slice(accounts, func(i, j int) bool {
+		if accounts[i].Entry.Provider != accounts[j].Entry.Provider {
+			return accounts[i].Entry.Provider < accounts[j].Entry.Provider
+		}
 		if accounts[i].IsActive != accounts[j].IsActive {
 			return accounts[i].IsActive
 		}
@@ -106,7 +125,7 @@ func (s *Switcher) ListAccounts(ctx context.Context) ([]AccountState, error) {
 	return accounts, nil
 }
 
-// SwitchToAccount manually sets targetAccount to be the active account (prefix: agy).
+// SwitchToAccount manually sets targetAccount to be the active account for its provider.
 func (s *Switcher) SwitchToAccount(ctx context.Context, targetAccount string, dryRun bool) (*SwitchResult, error) {
 	target := strings.TrimSpace(targetAccount)
 	if target == "" {
@@ -118,126 +137,134 @@ func (s *Switcher) SwitchToAccount(ctx context.Context, targetAccount string, dr
 		return nil, fmt.Errorf("list auth files: %w", err)
 	}
 
-	var targetState *AccountState
-	var activeState *AccountState
-	existingReserveIndices := make(map[int]bool)
+	type fileWithMeta struct {
+		entry client.AuthFileEntry
+		meta  client.AuthFileMetadata
+	}
+	var loadedFiles []fileWithMeta
+	var targetItem *fileWithMeta
 
 	for _, f := range files {
-		if !strings.EqualFold(strings.TrimSpace(f.Provider), strings.TrimSpace(s.cfg.Provider)) {
-			continue
-		}
-
 		name := f.Name
 		if name == "" {
 			name = f.ID
 		}
 
-		prefix, errPrefix := s.client.GetAuthFilePrefix(ctx, name)
-		if errPrefix != nil {
-			return nil, fmt.Errorf("read prefix for %s: %w", name, errPrefix)
+		meta, errMeta := s.client.GetAuthFileDetails(ctx, name)
+		if errMeta != nil {
+			return nil, fmt.Errorf("read metadata for %s: %w", name, errMeta)
 		}
 
-		state := AccountState{
-			Entry:     f,
-			Prefix:    prefix,
-			IsActive:  prefix == s.cfg.ActivePrefix,
-			IsReserve: strings.HasPrefix(prefix, s.cfg.ReservePrefixPrefix),
+		item := fileWithMeta{entry: f, meta: meta}
+		loadedFiles = append(loadedFiles, item)
+
+		// Match target by Prefix, ID, Name, or Email
+		if strings.EqualFold(meta.Prefix, target) || strings.EqualFold(f.ID, target) || strings.EqualFold(f.Name, target) || strings.EqualFold(f.Email, target) {
+			targetItem = &item
+		}
+	}
+
+	if targetItem == nil {
+		return nil, fmt.Errorf("account matching %q not found", target)
+	}
+
+	provider := targetItem.entry.Provider
+	activePrefix, reservePrefixPrefix := s.cfg.ConventionForProvider(provider)
+
+	var activeItem *fileWithMeta
+	existingReserveIndices := make(map[int]bool)
+
+	for i := range loadedFiles {
+		item := &loadedFiles[i]
+		if !strings.EqualFold(item.entry.Provider, provider) {
+			continue
 		}
 
-		if state.IsActive {
-			activeState = &state
+		if item.meta.Prefix == activePrefix {
+			activeItem = item
 		}
-
-		if state.IsReserve {
+		if strings.HasPrefix(item.meta.Prefix, reservePrefixPrefix) {
 			var idx int
-			numPart := strings.TrimPrefix(prefix, s.cfg.ReservePrefixPrefix)
+			numPart := strings.TrimPrefix(item.meta.Prefix, reservePrefixPrefix)
 			if _, errScan := fmt.Sscanf(numPart, "%d", &idx); errScan == nil {
 				existingReserveIndices[idx] = true
 			}
 		}
-
-		// Match target by Prefix, ID, Name, or Email
-		if strings.EqualFold(prefix, target) || strings.EqualFold(f.ID, target) || strings.EqualFold(f.Name, target) || strings.EqualFold(f.Email, target) {
-			targetState = &state
-		}
 	}
 
-	if targetState == nil {
-		return nil, fmt.Errorf("account matching %q not found for provider %q", target, s.cfg.Provider)
-	}
-
-	if targetState.IsActive {
+	if targetItem.meta.Prefix == activePrefix {
 		return &SwitchResult{
 			Rotated:       false,
-			ActiveAccount: targetState.Entry.ID,
-			Reason:        fmt.Sprintf("account %s is already active with prefix %q", targetState.Entry.ID, s.cfg.ActivePrefix),
+			ActiveAccount: targetItem.entry.ID,
+			Reason:        fmt.Sprintf("account %s is already active with prefix %q for provider %q", targetItem.entry.ID, activePrefix, provider),
 		}, nil
 	}
 
 	// Determine new reserve prefix for the demoted active account
-	newReservePrefix := targetState.Prefix
-	if !strings.HasPrefix(newReservePrefix, s.cfg.ReservePrefixPrefix) {
+	newReservePrefix := targetItem.meta.Prefix
+	if !strings.HasPrefix(newReservePrefix, reservePrefixPrefix) {
 		// Target was not a reserve (e.g. had another prefix or none); find first free sequence index
 		nextIdx := 1
 		for existingReserveIndices[nextIdx] {
 			nextIdx++
 		}
-		newReservePrefix = fmt.Sprintf("%s%d", s.cfg.ReservePrefixPrefix, nextIdx)
+		newReservePrefix = fmt.Sprintf("%s%d", reservePrefixPrefix, nextIdx)
 	}
 
 	if dryRun {
 		return &SwitchResult{
 			Rotated:         true,
-			ActiveAccount:   targetState.Entry.ID,
-			SelectedReserve: targetState.Prefix,
-			Reason: fmt.Sprintf("[DRY-RUN] Would promote %s to active (%s) and demote current active to %s",
-				targetState.Entry.ID, s.cfg.ActivePrefix, newReservePrefix),
+			ActiveAccount:   targetItem.entry.ID,
+			SelectedReserve: targetItem.meta.Prefix,
+			Reason: fmt.Sprintf("[DRY-RUN] Would promote %s to active (%s) and demote current active to %s (provider: %s)",
+				targetItem.entry.ID, activePrefix, newReservePrefix, provider),
 		}, nil
 	}
 
 	// Step 1: Promote target account to active prefix
-	nameTarget := targetState.Entry.Name
+	nameTarget := targetItem.entry.Name
 	if nameTarget == "" {
-		nameTarget = targetState.Entry.ID
+		nameTarget = targetItem.entry.ID
 	}
-	if err := s.client.PatchAuthPrefix(ctx, nameTarget, s.cfg.ActivePrefix); err != nil {
-		return nil, fmt.Errorf("failed to promote account %s to %q: %w", nameTarget, s.cfg.ActivePrefix, err)
+	if err := s.client.PatchAuthPrefix(ctx, nameTarget, activePrefix); err != nil {
+		return nil, fmt.Errorf("failed to promote account %s to %q: %w", nameTarget, activePrefix, err)
 	}
 
 	// Step 2: Demote previous active account if one existed
-	if activeState != nil {
-		nameActive := activeState.Entry.Name
+	if activeItem != nil {
+		nameActive := activeItem.entry.Name
 		if nameActive == "" {
-			nameActive = activeState.Entry.ID
+			nameActive = activeItem.entry.ID
 		}
 		if err := s.client.PatchAuthPrefix(ctx, nameActive, newReservePrefix); err != nil {
 			// Rollback target back to its original prefix
-			_ = s.client.PatchAuthPrefix(ctx, nameTarget, targetState.Prefix)
+			_ = s.client.PatchAuthPrefix(ctx, nameTarget, targetItem.meta.Prefix)
 			return nil, fmt.Errorf("failed to demote active account %s to %q: %w (rollback attempted)", nameActive, newReservePrefix, err)
 		}
 	}
 
 	return &SwitchResult{
 		Rotated:         true,
-		ActiveAccount:   targetState.Entry.ID,
-		SelectedReserve: targetState.Prefix,
-		Reason: fmt.Sprintf("manually promoted %s to active (%s); previous active assigned prefix %s",
-			targetState.Entry.ID, s.cfg.ActivePrefix, newReservePrefix),
+		ActiveAccount:   targetItem.entry.ID,
+		SelectedReserve: targetItem.meta.Prefix,
+		Reason: fmt.Sprintf("manually promoted %s to active (%s); previous active assigned prefix %s (provider: %s)",
+			targetItem.entry.ID, activePrefix, newReservePrefix, provider),
 	}, nil
 }
 
-// Run executes the evaluation and switching workflow.
-func (s *Switcher) Run(ctx context.Context, dryRun bool) (*SwitchResult, error) {
+// RunProvider evaluates and rotates a single provider.
+func (s *Switcher) RunProvider(ctx context.Context, provider string, dryRun bool) (*SwitchResult, error) {
 	files, err := s.client.ListAuthFiles(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list auth files: %w", err)
 	}
 
+	activePrefix, reservePrefixPrefix := s.cfg.ConventionForProvider(provider)
 	var providerAccounts []AccountState
 
 	// 1. Filter by provider and resolve prefixes
 	for _, f := range files {
-		if !strings.EqualFold(strings.TrimSpace(f.Provider), strings.TrimSpace(s.cfg.Provider)) {
+		if !strings.EqualFold(strings.TrimSpace(f.Provider), strings.TrimSpace(provider)) {
 			continue
 		}
 		if f.Disabled {
@@ -249,16 +276,17 @@ func (s *Switcher) Run(ctx context.Context, dryRun bool) (*SwitchResult, error) 
 			name = f.ID
 		}
 
-		prefix, errPrefix := s.client.GetAuthFilePrefix(ctx, name)
-		if errPrefix != nil {
-			return nil, fmt.Errorf("read prefix for %s: %w", name, errPrefix)
+		meta, errMeta := s.client.GetAuthFileDetails(ctx, name)
+		if errMeta != nil {
+			return nil, fmt.Errorf("read metadata for %s: %w", name, errMeta)
 		}
 
 		state := AccountState{
-			Entry:     f,
-			Prefix:    prefix,
-			IsActive:  prefix == s.cfg.ActivePrefix,
-			IsReserve: strings.HasPrefix(prefix, s.cfg.ReservePrefixPrefix),
+			Entry:            f,
+			Prefix:           meta.Prefix,
+			ChatGPTAccountID: meta.ChatGPTAccountID,
+			IsActive:         meta.Prefix == activePrefix,
+			IsReserve:        strings.HasPrefix(meta.Prefix, reservePrefixPrefix),
 		}
 		providerAccounts = append(providerAccounts, state)
 	}
@@ -266,7 +294,7 @@ func (s *Switcher) Run(ctx context.Context, dryRun bool) (*SwitchResult, error) 
 	if len(providerAccounts) == 0 {
 		return &SwitchResult{
 			Rotated: false,
-			Reason:  fmt.Sprintf("no active accounts found for provider %q", s.cfg.Provider),
+			Reason:  fmt.Sprintf("no active accounts found for provider %q", provider),
 		}, nil
 	}
 
@@ -278,8 +306,8 @@ func (s *Switcher) Run(ctx context.Context, dryRun bool) (*SwitchResult, error) 
 		acc := &providerAccounts[i]
 		if acc.IsActive {
 			if active != nil {
-				return nil, fmt.Errorf("multiple active accounts found with prefix %q: %s and %s",
-					s.cfg.ActivePrefix, active.Entry.ID, acc.Entry.ID)
+				return nil, fmt.Errorf("multiple active accounts found with prefix %q for provider %s: %s and %s",
+					activePrefix, provider, active.Entry.ID, acc.Entry.ID)
 			}
 			active = acc
 		} else if acc.IsReserve {
@@ -290,19 +318,24 @@ func (s *Switcher) Run(ctx context.Context, dryRun bool) (*SwitchResult, error) 
 	if active == nil {
 		return &SwitchResult{
 			Rotated: false,
-			Reason:  fmt.Sprintf("no account currently has active prefix %q", s.cfg.ActivePrefix),
+			Reason:  fmt.Sprintf("no account currently has active prefix %q for provider %q", activePrefix, provider),
 		}, nil
 	}
 
 	// 3. Fetch quota for active account
-	quotaBytes, errQuota := s.client.GetQuotaSummary(ctx, active.Entry.AuthIndex, active.Entry.ProjectID)
-	if errQuota != nil {
-		return nil, fmt.Errorf("fetch active account quota (%s): %w", active.Entry.ID, errQuota)
+	accountOrProjectID := active.Entry.ProjectID
+	if strings.EqualFold(provider, "codex") && active.ChatGPTAccountID != "" {
+		accountOrProjectID = active.ChatGPTAccountID
 	}
 
-	activeQuota, errParse := quota.ParseQuotaSummary(quotaBytes)
+	quotaBytes, errQuota := s.client.GetQuotaSummaryForProvider(ctx, provider, active.Entry.AuthIndex, accountOrProjectID)
+	if errQuota != nil {
+		return nil, fmt.Errorf("fetch active account quota (%s, %s): %w", provider, active.Entry.ID, errQuota)
+	}
+
+	activeQuota, errParse := quota.ParseQuotaSummaryForProvider(provider, quotaBytes)
 	if errParse != nil {
-		return nil, fmt.Errorf("parse active account quota (%s): %w", active.Entry.ID, errParse)
+		return nil, fmt.Errorf("parse active account quota (%s, %s): %w", provider, active.Entry.ID, errParse)
 	}
 	active.Quota = activeQuota
 
@@ -334,7 +367,7 @@ func (s *Switcher) Run(ctx context.Context, dryRun bool) (*SwitchResult, error) 
 		return &SwitchResult{
 			Rotated:       false,
 			ActiveAccount: active.Entry.ID,
-			Reason:        fmt.Sprintf("rotation triggered (%s), but no reserve accounts (prefix %s*) available", reason, s.cfg.ReservePrefixPrefix),
+			Reason:        fmt.Sprintf("rotation triggered (%s), but no reserve accounts (prefix %s*) available for provider %q", reason, reservePrefixPrefix, provider),
 		}, nil
 	}
 
@@ -346,14 +379,18 @@ func (s *Switcher) Run(ctx context.Context, dryRun bool) (*SwitchResult, error) 
 	var eligible []candidate
 
 	for _, res := range reserves {
-		qBytes, err := s.client.GetQuotaSummary(ctx, res.Entry.AuthIndex, res.Entry.ProjectID)
+		resAccountOrProjectID := res.Entry.ProjectID
+		if strings.EqualFold(provider, "codex") && res.ChatGPTAccountID != "" {
+			resAccountOrProjectID = res.ChatGPTAccountID
+		}
+
+		qBytes, err := s.client.GetQuotaSummaryForProvider(ctx, provider, res.Entry.AuthIndex, resAccountOrProjectID)
 		if err != nil {
-			// Skip failing reserve, log reason
 			res.QuotaErr = err
 			continue
 		}
 
-		parsed, err := quota.ParseQuotaSummary(qBytes)
+		parsed, err := quota.ParseQuotaSummaryForProvider(provider, qBytes)
 		if err != nil {
 			res.QuotaErr = err
 			continue
@@ -377,7 +414,7 @@ func (s *Switcher) Run(ctx context.Context, dryRun bool) (*SwitchResult, error) 
 		return &SwitchResult{
 			Rotated:       false,
 			ActiveAccount: active.Entry.ID,
-			Reason:        fmt.Sprintf("rotation triggered (%s), but all reserves exceed thresholds or failed quota check", reason),
+			Reason:        fmt.Sprintf("rotation triggered (%s), but all reserves exceed thresholds or failed quota check for provider %q", reason, provider),
 		}, nil
 	}
 
@@ -397,28 +434,25 @@ func (s *Switcher) Run(ctx context.Context, dryRun bool) (*SwitchResult, error) 
 			Rotated:         true,
 			ActiveAccount:   active.Entry.ID,
 			SelectedReserve: bestReserve.Entry.ID,
-			Reason: fmt.Sprintf("[DRY-RUN] Would swap %s (%s) <-> %s (%s) (reason: %s, reserve min available: %.1f%%)",
-				active.Entry.ID, s.cfg.ActivePrefix, bestReserve.Entry.ID, reserveOriginalPrefix, reason, eligible[0].minRemain),
+			Reason: fmt.Sprintf("[DRY-RUN] Would swap %s (%s) <-> %s (%s) (reason: %s, reserve min available: %.1f%%, provider: %s)",
+				active.Entry.ID, activePrefix, bestReserve.Entry.ID, reserveOriginalPrefix, reason, eligible[0].minRemain, provider),
 		}, nil
 	}
 
 	// 7. Execute 2-step direct swap (Policy 4A)
-	// Step 1: Promote reserve account to active prefix first (transient duplicate permitted)
 	nameReserve := bestReserve.Entry.Name
 	if nameReserve == "" {
 		nameReserve = bestReserve.Entry.ID
 	}
-	if err := s.client.PatchAuthPrefix(ctx, nameReserve, s.cfg.ActivePrefix); err != nil {
-		return nil, fmt.Errorf("failed to promote reserve account %s to active prefix %q: %w", nameReserve, s.cfg.ActivePrefix, err)
+	if err := s.client.PatchAuthPrefix(ctx, nameReserve, activePrefix); err != nil {
+		return nil, fmt.Errorf("failed to promote reserve account %s to active prefix %q: %w", nameReserve, activePrefix, err)
 	}
 
-	// Step 2: Demote previous active account to reserve prefix
 	nameActive := active.Entry.Name
 	if nameActive == "" {
 		nameActive = active.Entry.ID
 	}
 	if err := s.client.PatchAuthPrefix(ctx, nameActive, reserveOriginalPrefix); err != nil {
-		// Attempt safe recovery: restore reserve account back to its original prefix
 		_ = s.client.PatchAuthPrefix(ctx, nameReserve, reserveOriginalPrefix)
 		return nil, fmt.Errorf("failed to demote previous active account %s to %q: %w (rollback attempted)", nameActive, reserveOriginalPrefix, err)
 	}
@@ -427,9 +461,42 @@ func (s *Switcher) Run(ctx context.Context, dryRun bool) (*SwitchResult, error) 
 		Rotated:         true,
 		ActiveAccount:   bestReserve.Entry.ID,
 		SelectedReserve: active.Entry.ID,
-		Reason: fmt.Sprintf("swapped %s (%s -> %s) and %s (%s -> %s) due to: %s",
-			bestReserve.Entry.ID, reserveOriginalPrefix, s.cfg.ActivePrefix,
-			active.Entry.ID, s.cfg.ActivePrefix, reserveOriginalPrefix,
-			reason),
+		Reason: fmt.Sprintf("swapped %s (%s -> %s) and %s (%s -> %s) due to: %s (provider: %s)",
+			bestReserve.Entry.ID, reserveOriginalPrefix, activePrefix,
+			active.Entry.ID, activePrefix, reserveOriginalPrefix,
+			reason, provider),
+	}, nil
+}
+
+// Run executes the evaluation and switching workflow across all resolved providers.
+func (s *Switcher) Run(ctx context.Context, dryRun bool) (*SwitchResult, error) {
+	providers := s.cfg.ResolvedProviders()
+	if len(providers) == 1 {
+		return s.RunProvider(ctx, providers[0], dryRun)
+	}
+
+	var anyRotated bool
+	var reasons []string
+	var lastActiveAccount string
+	var lastSelectedReserve string
+
+	for _, p := range providers {
+		res, err := s.RunProvider(ctx, p, dryRun)
+		if err != nil {
+			return nil, fmt.Errorf("provider %s rotation failed: %w", p, err)
+		}
+		if res.Rotated {
+			anyRotated = true
+			lastActiveAccount = res.ActiveAccount
+			lastSelectedReserve = res.SelectedReserve
+		}
+		reasons = append(reasons, fmt.Sprintf("[%s] %s", p, res.Reason))
+	}
+
+	return &SwitchResult{
+		Rotated:         anyRotated,
+		ActiveAccount:   lastActiveAccount,
+		SelectedReserve: lastSelectedReserve,
+		Reason:          strings.Join(reasons, " | "),
 	}, nil
 }

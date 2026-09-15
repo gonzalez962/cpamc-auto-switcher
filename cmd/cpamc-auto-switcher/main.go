@@ -20,7 +20,8 @@ func main() {
 	configPathFlag := flag.String("config", "", "Path to configuration file (default: ~/.local/share/cpamc-auto-switcher/config.json)")
 	initFlag := flag.Bool("init", false, "Initialize or update credentials configuration interactively")
 	listFlag := flag.Bool("list", false, "List all accounts, their prefix, and current quota usage")
-	switchFlag := flag.String("switch", "", "Manually promote specified account (by prefix, ID, filename, or email) to active (agy)")
+	providerFlag := flag.String("provider", "", "Target provider to evaluate (antigravity, codex, or all; default from config or 'all')")
+	switchFlag := flag.String("switch", "", "Manually promote specified account (by prefix, ID, filename, or email) to active")
 	checkFlag := flag.Bool("check", false, "Check quotas and evaluate rotation without modifying prefixes (dry-run)")
 	dryRunFlag := flag.Bool("dry-run", false, "Alias for --check")
 	endpointFlag := flag.String("endpoint", "", "Override API endpoint (e.g. http://localhost:8000)")
@@ -52,6 +53,9 @@ func main() {
 	}
 
 	// Apply CLI overrides if provided
+	if strings.TrimSpace(*providerFlag) != "" {
+		cfg.Provider = strings.TrimSpace(*providerFlag)
+	}
 	if strings.TrimSpace(*endpointFlag) != "" {
 		cfg.Endpoint = strings.TrimSpace(*endpointFlag)
 	}
@@ -66,8 +70,7 @@ func main() {
 
 	if *verboseFlag {
 		fmt.Printf("[INFO] Using endpoint: %s\n", cfg.Endpoint)
-		fmt.Printf("[INFO] Target provider: %s\n", cfg.Provider)
-		fmt.Printf("[INFO] Active prefix: %s | Reserve prefix: %s*\n", cfg.ActivePrefix, cfg.ReservePrefixPrefix)
+		fmt.Printf("[INFO] Target provider(s): %v\n", cfg.ResolvedProviders())
 		fmt.Printf("[INFO] Thresholds: 5-Hour >= %.1f%% | Weekly >= %.1f%%\n", cfg.FiveHourThreshold, cfg.WeeklyThreshold)
 	}
 
@@ -123,12 +126,12 @@ func main() {
 		}
 
 		if len(accounts) == 0 {
-			fmt.Printf("No accounts found for provider %q\n", cfg.Provider)
+			fmt.Printf("No accounts found for provider(s) %v\n", cfg.ResolvedProviders())
 			return
 		}
 
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-		fmt.Fprintln(w, "STATUS\tACCOUNT ID\tPREFIX\t5H CONSUMED\tWEEKLY CONSUMED\tMIN AVAILABLE\tDETAILS")
+		fmt.Fprintln(w, "STATUS\tPROVIDER\tACCOUNT ID\tPREFIX\t5H CONSUMED\tWEEKLY CONSUMED\tMIN AVAILABLE\tDETAILS")
 
 		for _, acc := range accounts {
 			statusTag := "[RESERVE]"
@@ -158,8 +161,9 @@ func main() {
 				minAvailStr = fmt.Sprintf("%.1f%%", acc.Quota.MinAvailableRemaining())
 			}
 
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 				statusTag,
+				acc.Entry.Provider,
 				acc.Entry.ID,
 				acc.Prefix,
 				fiveHStr,

@@ -79,4 +79,25 @@ func TestConfigValidation(t *testing.T) {
 	if cfg.CooldownMinutes != DefaultCooldownMinutes {
 		t.Errorf("expected default cooldown %f, got %f", DefaultCooldownMinutes, cfg.CooldownMinutes)
 	}
+
+	// Test ResolvedProviders and ConventionForProvider
+	allProviders := cfg.ResolvedProviders()
+	if len(allProviders) != 2 || allProviders[0] != "antigravity" || allProviders[1] != "codex" {
+		t.Errorf("unexpected resolved providers for 'all': %v", allProviders)
+	}
+
+	agActive, agReserve := cfg.ConventionForProvider("antigravity")
+	if agActive != "agy" || agReserve != "agy_" {
+		t.Errorf("unexpected antigravity convention: %s, %s", agActive, agReserve)
+	}
+
+	codexActive, codexReserve := cfg.ConventionForProvider("codex")
+	if codexActive != "codex" || codexReserve != "codex_" {
+		t.Errorf("unexpected codex convention: %s, %s", codexActive, codexReserve)
+	}
+
+	cfg.Provider = "codex"
+	if len(cfg.ResolvedProviders()) != 1 || cfg.ResolvedProviders()[0] != "codex" {
+		t.Errorf("expected only codex resolved, got %v", cfg.ResolvedProviders())
+	}
 }

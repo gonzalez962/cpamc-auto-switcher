@@ -11,13 +11,16 @@ import (
 
 // Default settings
 const (
-	DefaultProvider            = "antigravity"
+	DefaultProvider            = "all"
 	DefaultActivePrefix        = "agy"
 	DefaultReservePrefixPrefix = "agy_"
 	DefaultFiveHourThreshold   = 90.0
 	DefaultWeeklyThreshold     = 95.0
 	DefaultCooldownMinutes     = 5.0
 )
+
+// SupportedProviders lists providers handled by cpamc-auto-switcher.
+var SupportedProviders = []string{"antigravity", "codex"}
 
 // Config holds runtime configuration for cpamc-auto-switcher.
 type Config struct {
@@ -49,6 +52,38 @@ func NewDefaultConfig() *Config {
 		FiveHourThreshold:   DefaultFiveHourThreshold,
 		WeeklyThreshold:     DefaultWeeklyThreshold,
 		CooldownMinutes:     DefaultCooldownMinutes,
+	}
+}
+
+// ResolvedProviders returns the list of providers to inspect. If Provider is "all",
+// it returns all supported providers.
+func (c *Config) ResolvedProviders() []string {
+	p := strings.ToLower(strings.TrimSpace(c.Provider))
+	if p == "" || p == "all" {
+		return []string{"antigravity", "codex"}
+	}
+	return []string{p}
+}
+
+// ConventionForProvider resolves active and reserve prefixes for the specified provider.
+func (c *Config) ConventionForProvider(provider string) (activePrefix, reservePrefixPrefix string) {
+	p := strings.ToLower(strings.TrimSpace(provider))
+	switch p {
+	case "codex":
+		if strings.EqualFold(c.Provider, "codex") && c.ActivePrefix != "" && c.ActivePrefix != "agy" {
+			return c.ActivePrefix, c.ReservePrefixPrefix
+		}
+		return "codex", "codex_"
+	case "antigravity":
+		if (strings.EqualFold(c.Provider, "antigravity") || c.Provider == "all") && c.ActivePrefix != "" && c.ReservePrefixPrefix != "" {
+			return c.ActivePrefix, c.ReservePrefixPrefix
+		}
+		return "agy", "agy_"
+	default:
+		if c.ActivePrefix != "" && c.ReservePrefixPrefix != "" {
+			return c.ActivePrefix, c.ReservePrefixPrefix
+		}
+		return "agy", "agy_"
 	}
 }
 
