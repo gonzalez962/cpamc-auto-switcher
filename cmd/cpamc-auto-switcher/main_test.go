@@ -185,3 +185,100 @@ func TestExtractAccountEmail(t *testing.T) {
 		}
 	}
 }
+
+func TestAbbreviateEmail(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "requested example testerone@example.com",
+			input:    "testerone@example.com",
+			expected: "tes...one@example.com",
+		},
+		{
+			name:     "local part exactly 6 characters unchanged",
+			input:    "direct@example.org",
+			expected: "direct@example.org",
+		},
+		{
+			name:     "local part exactly 6 characters alphanumeric",
+			input:    "123456@example.com",
+			expected: "123456@example.com",
+		},
+		{
+			name:     "local part 5 characters unchanged",
+			input:    "admin@example.com",
+			expected: "admin@example.com",
+		},
+		{
+			name:     "local part 1 character unchanged",
+			input:    "a@example.com",
+			expected: "a@example.com",
+		},
+		{
+			name:     "local part exactly 7 characters abbreviated",
+			input:    "1234567@example.com",
+			expected: "123...567@example.com",
+		},
+		{
+			name:     "local part 8 characters abbreviated",
+			input:    "12345678@example.com",
+			expected: "123...678@example.com",
+		},
+		{
+			name:     "longer email userlongname12345",
+			input:    "userlongname12345@example.com",
+			expected: "use...345@example.com",
+		},
+		{
+			name:     "longer email elevenchars",
+			input:    "elevenchars@example.net",
+			expected: "ele...ars@example.net",
+		},
+		{
+			name:     "longer email with subdomain",
+			input:    "developer@sub.example.net",
+			expected: "dev...per@sub.example.net",
+		},
+		{
+			name:     "non-email identifier unchanged",
+			input:    "no-email-account-id",
+			expected: "no-email-account-id",
+		},
+		{
+			name:     "empty string unchanged",
+			input:    "",
+			expected: "",
+		},
+		{
+			name:     "empty local part unchanged",
+			input:    "@example.com",
+			expected: "@example.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := abbreviateEmail(tt.input)
+			if got != tt.expected {
+				t.Errorf("abbreviateEmail(%q) = %q, expected %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestAccountDisplayAbbreviationEndToEnd(t *testing.T) {
+	id := "antigravity-testerone@example.com.json"
+	raw := extractAccountEmail(id, id, "")
+	if raw != "testerone@example.com" {
+		t.Fatalf("extractAccountEmail = %q, expected %q", raw, "testerone@example.com")
+	}
+
+	display := abbreviateEmail(raw)
+	expected := "tes...one@example.com"
+	if display != expected {
+		t.Fatalf("abbreviateEmail(%q) = %q, expected %q", raw, display, expected)
+	}
+}

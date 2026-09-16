@@ -47,6 +47,20 @@ func extractAccountEmail(id, name, email string) string {
 	return strings.TrimSpace(name)
 }
 
+func abbreviateEmail(email string) string {
+	atIdx := strings.LastIndex(email, "@")
+	if atIdx == -1 {
+		return email
+	}
+	local := email[:atIdx]
+	domain := email[atIdx:]
+	runes := []rune(local)
+	if len(runes) <= 6 {
+		return email
+	}
+	return string(runes[:3]) + "..." + string(runes[len(runes)-3:]) + domain
+}
+
 func main() {
 	configPathFlag := flag.String("config", "", "Path to configuration file (default: ~/.local/share/cpamc-auto-switcher/config.json)")
 	initFlag := flag.Bool("init", false, "Initialize or update credentials configuration interactively")
@@ -193,7 +207,7 @@ func main() {
 				minAvailStr = fmt.Sprintf("%.1f%%", acc.Quota.MinAvailableRemaining())
 			}
 
-			accountDisplay := extractAccountEmail(acc.Entry.ID, acc.Entry.Name, acc.Entry.Email)
+			accountDisplay := abbreviateEmail(extractAccountEmail(acc.Entry.ID, acc.Entry.Name, acc.Entry.Email))
 
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 				statusTag,
