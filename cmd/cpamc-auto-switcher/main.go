@@ -3,10 +3,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -75,6 +78,7 @@ func main() {
 	verboseFlag := flag.Bool("verbose", false, "Enable detailed logging")
 	forceFlag := flag.Bool("force", false, "Bypass cooldown timeout and force quota evaluation immediately")
 	cooldownFlag := flag.Duration("cooldown", 0, "Override cooldown duration between quota checks (e.g. 5m; default: 5m from config)")
+	fiveHourThresholdFlag, fiveHThresholdFlag, weeklyThresholdFlag := addThresholdFlags(flag.CommandLine)
 
 	flag.Parse()
 
@@ -109,7 +113,7 @@ func main() {
 		cfg.ManagementKey = strings.TrimSpace(*keyFlag)
 	}
 
-	if err := cfg.Validate(); err != nil {
+	if err := applyThresholdOverrides(cfg, *fiveHourThresholdFlag, *fiveHThresholdFlag, *weeklyThresholdFlag); err != nil {
 		fmt.Fprintf(os.Stderr, "Configuration validation error: %v\n", err)
 		os.Exit(1)
 	}
@@ -305,34 +309,147 @@ func main() {
 	}
 }
 
+func addThresholdFlags(fs *flag.FlagSet) (fiveHour *float64, fiveHAlias *float64, weekly *float64) {
+	fiveHour = fs.Float64("five-hour-threshold", 0, "Override 5-hour quota consumption threshold percentage (e.g. 85.0)")
+	fiveHAlias = fs.Float64("5h-threshold", 0, "Alias for -five-hour-threshold")
+	weekly = fs.Float64("weekly-threshold", 0, "Override weekly quota consumption threshold percentage (e.g. 90.0)")
+	return
+}
+
+func applyThresholdOverrides(cfg *config.Config, fiveHour, fiveHAlias, weekly float64) error {
+	if fiveHour > 0 {
+		cfg.FiveHourThreshold = fiveHour
+	} else if fiveHAlias > 0 {
+		cfg.FiveHourThreshold = fiveHAlias
+	}
+	if weekly > 0 {
+		cfg.WeeklyThreshold = weekly
+	}
+	return cfg.Validate()
+}
+
+func readInputLine(reader *bufio.Reader) (string, error) {
+	line, err := reader.ReadString('\n')
+	if err != nil && len(line) == 0 {
+		return "", err
+	}
+	return strings.TrimSpace(line), nil
+}
+
 func runInteractiveInit(customPath string) error {
-	reader := bufio.NewReader(os.Stdin)
+	return runInteractiveInitWithIO(customPath, os.Stdin, os.Stdout)
+}
 
-	fmt.Println("=== cpamc-auto-switcher configuration setup ===")
-
-	fmt.Print("Enter CLIProxyAPI endpoint URL (e.g. http://localhost:8000): ")
-	endpoint, _ := reader.ReadString('\n')
-	endpoint = strings.TrimSpace(endpoint)
-	if endpoint == "" {
-		endpoint = "http://localhost:8000"
-	}
-
-	fmt.Print("Enter management key: ")
-	key, _ := reader.ReadString('\n')
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return fmt.Errorf("management key cannot be empty")
-	}
+func runInteractiveInitWithIO(customPath string, r io.Reader, w io.Writer) error {
+	reader := bufio.NewReader(r)
 
 	cfg := config.NewDefaultConfig()
-	cfg.Endpoint = endpoint
-	cfg.ManagementKey = key
+	targetPath := customPath
+	if strings.TrimSpace(targetPath) == "" {
+		if defPath, err := config.DefaultConfigPath(); err == nil {
+			targetPath = defPath
+		}
+	}
+
+	if targetPath != "" {
+		if data, err := os.ReadFile(targetPath); err == nil {
+			if err := json.Unmarshal(data, cfg); err != nil {
+				return fmt.Errorf("failed to parse existing config at %s: %w", targetPath, err)
+			}
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("failed to read existing config at %s: %w", targetPath, err)
+		}
+	}
+
+	fmt.Fprintln(w, "=== cpamc-auto-switcher configuration setup ===")
+
+	// 1. Endpoint
+	defaultEndpoint := "http://localhost:8000"
+	if strings.TrimSpace(cfg.Endpoint) != "" {
+		defaultEndpoint = strings.TrimSpace(cfg.Endpoint)
+	}
+	fmt.Fprintf(w, "Enter CLIProxyAPI endpoint URL [%s]: ", defaultEndpoint)
+	endpointInput, err := readInputLine(reader)
+	if err != nil {
+		return err
+	}
+	if endpointInput != "" {
+		cfg.Endpoint = endpointInput
+	} else {
+		cfg.Endpoint = defaultEndpoint
+	}
+
+	// 2. Management Key
+	if strings.TrimSpace(cfg.ManagementKey) != "" {
+		fmt.Fprint(w, "Enter management key [leave blank to keep current]: ")
+		keyInput, err := readInputLine(reader)
+		if err != nil {
+			return err
+		}
+		if keyInput != "" {
+			cfg.ManagementKey = keyInput
+		}
+	} else {
+		fmt.Fprint(w, "Enter management key: ")
+		keyInput, err := readInputLine(reader)
+		if err != nil {
+			return err
+		}
+		if keyInput == "" {
+			return fmt.Errorf("management key cannot be empty")
+		}
+		cfg.ManagementKey = keyInput
+	}
+
+	// 3. 5-Hour Threshold
+	default5H := 90.0
+	if cfg.FiveHourThreshold > 0 {
+		default5H = cfg.FiveHourThreshold
+	}
+	fmt.Fprintf(w, "Enter 5-hour threshold percentage [%.1f]: ", default5H)
+	fiveHInput, err := readInputLine(reader)
+	if err != nil {
+		return err
+	}
+	if fiveHInput != "" {
+		val, err := strconv.ParseFloat(fiveHInput, 64)
+		if err != nil {
+			return fmt.Errorf("invalid 5-hour threshold: %w", err)
+		}
+		cfg.FiveHourThreshold = val
+	} else {
+		cfg.FiveHourThreshold = default5H
+	}
+
+	// 4. Weekly Threshold
+	defaultWeekly := 95.0
+	if cfg.WeeklyThreshold > 0 {
+		defaultWeekly = cfg.WeeklyThreshold
+	}
+	fmt.Fprintf(w, "Enter weekly threshold percentage [%.1f]: ", defaultWeekly)
+	weeklyInput, err := readInputLine(reader)
+	if err != nil {
+		return err
+	}
+	if weeklyInput != "" {
+		val, err := strconv.ParseFloat(weeklyInput, 64)
+		if err != nil {
+			return fmt.Errorf("invalid weekly threshold: %w", err)
+		}
+		cfg.WeeklyThreshold = val
+	} else {
+		cfg.WeeklyThreshold = defaultWeekly
+	}
+
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("configuration validation error: %w", err)
+	}
 
 	path, err := cfg.Save(customPath)
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("\nConfiguration successfully saved to %s (permissions 0600)\n", path)
+	fmt.Fprintf(w, "\nConfiguration successfully saved to %s (permissions 0600)\n", path)
 	return nil
 }

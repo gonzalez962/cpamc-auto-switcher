@@ -44,14 +44,21 @@ go install ./cmd/cpamc-auto-switcher
 
 ### 2. Configure Credentials
 
-Run interactive setup to configure the endpoint URL and management key:
+Run interactive setup to configure the endpoint URL, management key, and quota thresholds:
 
 ```bash
 cpamc-auto-switcher -init
 ```
 
+The interactive wizard supports both initial setup and updating existing configurations:
+- **Endpoint URL**: Displays the current endpoint (or `http://localhost:8000` by default). Pressing Enter retains the current endpoint.
+- **Management Key**: If a key is already saved, displays `[leave blank to keep current]`; pressing Enter keeps the existing key. On first-time setup, a non-empty key is required.
+- **5-Hour Threshold**: Displays the current or default percentage (default `90.0`). Pressing Enter keeps the default, or enter a custom float.
+- **Weekly Threshold**: Displays the current or default percentage (default `95.0`). Pressing Enter keeps the default, or enter a custom float.
+- **Preserved Settings**: Existing configuration settings including `provider`, `active_prefix`, `reserve_prefix_prefix`, and `cooldown_minutes` are safely preserved when updating.
+
 Default config file location:
-`~/.local/share/cpamc-auto-switcher/config.json`
+`~/.local/share/cpamc-auto-switcher/config.json` (or supply custom path via `-config <path>`)
 
 Example configuration:
 ```json
@@ -150,4 +157,26 @@ Display detailed evaluation logs (including remaining cooldown time if active):
 
 ```bash
 cpamc-auto-switcher -verbose
+```
+
+### Quota Threshold Flags
+Override the quota consumption trigger thresholds via CLI flags for the current run without modifying `config.json`:
+
+- `-five-hour-threshold <float>`: Override the 5-hour consumption threshold percentage.
+- `-5h-threshold <float>`: Short alias for `-five-hour-threshold`.
+- `-weekly-threshold <float>`: Override the weekly consumption threshold percentage.
+
+```bash
+# Override 5-hour threshold (e.g. rotate when >= 80% consumed):
+cpamc-auto-switcher -five-hour-threshold 80.0
+
+# Using the short alias for 5-hour threshold:
+cpamc-auto-switcher -5h-threshold 80.0
+
+# Override weekly threshold (e.g. rotate when >= 90% consumed):
+cpamc-auto-switcher -weekly-threshold 90.0
+
+# Combine threshold overrides with dry-run check or automatic rotation:
+cpamc-auto-switcher -check -5h-threshold 85.0 -weekly-threshold 92.0
+cpamc-auto-switcher -profile p1 -5h-threshold 80.0 -weekly-threshold 90.0
 ```

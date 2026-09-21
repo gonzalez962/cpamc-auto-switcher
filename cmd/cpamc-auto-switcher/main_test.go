@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"flag"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -449,4 +452,427 @@ func TestProfileSwitchAndRotationIntegration(t *testing.T) {
 		t.Fatalf("default pool modified: %+v", prefixes)
 	}
 }
+
+func TestThresholdFlagOverrides(t *testing.T) {
+	t.Run("default thresholds when no flags provided", func(t *testing.T) {
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		fiveHour, fiveHAlias, weekly := addThresholdFlags(fs)
+		if err := fs.Parse([]string{}); err != nil {
+			t.Fatalf("fs.Parse failed: %v", err)
+		}
+
+		cfg := config.NewDefaultConfig()
+		cfg.Endpoint = "http://localhost:8000"
+		cfg.ManagementKey = "test-key"
+
+		if err := applyThresholdOverrides(cfg, *fiveHour, *fiveHAlias, *weekly); err != nil {
+			t.Fatalf("applyThresholdOverrides failed: %v", err)
+		}
+		if cfg.FiveHourThreshold != config.DefaultFiveHourThreshold {
+			t.Errorf("expected default 5h threshold %.1f, got %.1f", config.DefaultFiveHourThreshold, cfg.FiveHourThreshold)
+		}
+		if cfg.WeeklyThreshold != config.DefaultWeeklyThreshold {
+			t.Errorf("expected default weekly threshold %.1f, got %.1f", config.DefaultWeeklyThreshold, cfg.WeeklyThreshold)
+		}
+	})
+
+	t.Run("override five-hour-threshold", func(t *testing.T) {
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		fiveHour, fiveHAlias, weekly := addThresholdFlags(fs)
+		if err := fs.Parse([]string{"-five-hour-threshold", "82.5"}); err != nil {
+			t.Fatalf("fs.Parse failed: %v", err)
+		}
+
+		cfg := config.NewDefaultConfig()
+		cfg.Endpoint = "http://localhost:8000"
+		cfg.ManagementKey = "test-key"
+
+		if err := applyThresholdOverrides(cfg, *fiveHour, *fiveHAlias, *weekly); err != nil {
+			t.Fatalf("applyThresholdOverrides failed: %v", err)
+		}
+		if cfg.FiveHourThreshold != 82.5 {
+			t.Errorf("expected 5h threshold 82.5, got %.1f", cfg.FiveHourThreshold)
+		}
+		if cfg.WeeklyThreshold != config.DefaultWeeklyThreshold {
+			t.Errorf("expected default weekly threshold %.1f, got %.1f", config.DefaultWeeklyThreshold, cfg.WeeklyThreshold)
+		}
+	})
+
+	t.Run("override 5h-threshold alias", func(t *testing.T) {
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		fiveHour, fiveHAlias, weekly := addThresholdFlags(fs)
+		if err := fs.Parse([]string{"-5h-threshold", "78.0"}); err != nil {
+			t.Fatalf("fs.Parse failed: %v", err)
+		}
+
+		cfg := config.NewDefaultConfig()
+		cfg.Endpoint = "http://localhost:8000"
+		cfg.ManagementKey = "test-key"
+
+		if err := applyThresholdOverrides(cfg, *fiveHour, *fiveHAlias, *weekly); err != nil {
+			t.Fatalf("applyThresholdOverrides failed: %v", err)
+		}
+		if cfg.FiveHourThreshold != 78.0 {
+			t.Errorf("expected 5h threshold 78.0 via alias, got %.1f", cfg.FiveHourThreshold)
+		}
+		if cfg.WeeklyThreshold != config.DefaultWeeklyThreshold {
+			t.Errorf("expected default weekly threshold %.1f, got %.1f", config.DefaultWeeklyThreshold, cfg.WeeklyThreshold)
+		}
+	})
+
+	t.Run("override weekly-threshold", func(t *testing.T) {
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		fiveHour, fiveHAlias, weekly := addThresholdFlags(fs)
+		if err := fs.Parse([]string{"-weekly-threshold", "89.5"}); err != nil {
+			t.Fatalf("fs.Parse failed: %v", err)
+		}
+
+		cfg := config.NewDefaultConfig()
+		cfg.Endpoint = "http://localhost:8000"
+		cfg.ManagementKey = "test-key"
+
+		if err := applyThresholdOverrides(cfg, *fiveHour, *fiveHAlias, *weekly); err != nil {
+			t.Fatalf("applyThresholdOverrides failed: %v", err)
+		}
+		if cfg.FiveHourThreshold != config.DefaultFiveHourThreshold {
+			t.Errorf("expected default 5h threshold %.1f, got %.1f", config.DefaultFiveHourThreshold, cfg.FiveHourThreshold)
+		}
+		if cfg.WeeklyThreshold != 89.5 {
+			t.Errorf("expected weekly threshold 89.5, got %.1f", cfg.WeeklyThreshold)
+		}
+	})
+
+	t.Run("override both 5h alias and weekly threshold", func(t *testing.T) {
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		fiveHour, fiveHAlias, weekly := addThresholdFlags(fs)
+		if err := fs.Parse([]string{"-5h-threshold", "81.0", "-weekly-threshold", "87.5"}); err != nil {
+			t.Fatalf("fs.Parse failed: %v", err)
+		}
+
+		cfg := config.NewDefaultConfig()
+		cfg.Endpoint = "http://localhost:8000"
+		cfg.ManagementKey = "test-key"
+
+		if err := applyThresholdOverrides(cfg, *fiveHour, *fiveHAlias, *weekly); err != nil {
+			t.Fatalf("applyThresholdOverrides failed: %v", err)
+		}
+		if cfg.FiveHourThreshold != 81.0 {
+			t.Errorf("expected 5h threshold 81.0, got %.1f", cfg.FiveHourThreshold)
+		}
+		if cfg.WeeklyThreshold != 87.5 {
+			t.Errorf("expected weekly threshold 87.5, got %.1f", cfg.WeeklyThreshold)
+		}
+	})
+
+	t.Run("zero or negative flags do not override custom existing thresholds", func(t *testing.T) {
+		cfg := &config.Config{
+			Endpoint:          "http://localhost:8000",
+			ManagementKey:     "test-key",
+			FiveHourThreshold: 72.0,
+			WeeklyThreshold:   82.0,
+		}
+
+		if err := applyThresholdOverrides(cfg, 0, 0, 0); err != nil {
+			t.Fatalf("applyThresholdOverrides failed: %v", err)
+		}
+		if cfg.FiveHourThreshold != 72.0 || cfg.WeeklyThreshold != 82.0 {
+			t.Errorf("expected thresholds to remain 72.0 and 82.0, got %.1f and %.1f",
+				cfg.FiveHourThreshold, cfg.WeeklyThreshold)
+		}
+	})
+
+	t.Run("out of range threshold values normalized by Validate", func(t *testing.T) {
+		cfg := config.NewDefaultConfig()
+		cfg.Endpoint = "http://localhost:8000"
+		cfg.ManagementKey = "test-key"
+
+		if err := applyThresholdOverrides(cfg, 150.0, 0, -10.0); err != nil {
+			t.Fatalf("applyThresholdOverrides failed: %v", err)
+		}
+		if cfg.FiveHourThreshold != config.DefaultFiveHourThreshold {
+			t.Errorf("expected out of range 5h to reset to %.1f, got %.1f",
+				config.DefaultFiveHourThreshold, cfg.FiveHourThreshold)
+		}
+		if cfg.WeeklyThreshold != config.DefaultWeeklyThreshold {
+			t.Errorf("expected out of range weekly to reset to %.1f, got %.1f",
+				config.DefaultWeeklyThreshold, cfg.WeeklyThreshold)
+		}
+	})
+
+	t.Run("validation error on missing endpoint or key", func(t *testing.T) {
+		cfg := config.NewDefaultConfig() // Endpoint and ManagementKey are empty
+		if err := applyThresholdOverrides(cfg, 85.0, 0, 90.0); err == nil {
+			t.Fatal("expected validation error for empty endpoint/key, got nil")
+		}
+	})
+}
+
+func TestRunInteractiveInitWithIO_NewConfig(t *testing.T) {
+	t.Run("accept all defaults except required key", func(t *testing.T) {
+		tempDir := t.TempDir()
+		configPath := filepath.Join(tempDir, "config.json")
+
+		// Input: Enter (default endpoint), "my-secret-key", Enter (default 5h), Enter (default weekly)
+		input := "\nmy-secret-key\n\n\n"
+		var out bytes.Buffer
+
+		if err := runInteractiveInitWithIO(configPath, strings.NewReader(input), &out); err != nil {
+			t.Fatalf("runInteractiveInitWithIO failed: %v", err)
+		}
+
+		outputStr := out.String()
+		if !strings.Contains(outputStr, "Enter CLIProxyAPI endpoint URL [http://localhost:8000]: ") {
+			t.Errorf("expected default endpoint prompt, got: %s", outputStr)
+		}
+		if !strings.Contains(outputStr, "Enter management key: ") {
+			t.Errorf("expected clean management key prompt, got: %s", outputStr)
+		}
+		if !strings.Contains(outputStr, "Enter 5-hour threshold percentage [90.0]: ") {
+			t.Errorf("expected default 5h threshold prompt, got: %s", outputStr)
+		}
+		if !strings.Contains(outputStr, "Enter weekly threshold percentage [95.0]: ") {
+			t.Errorf("expected default weekly threshold prompt, got: %s", outputStr)
+		}
+
+		cfg, _, err := config.Load(configPath)
+		if err != nil {
+			t.Fatalf("failed to load saved config: %v", err)
+		}
+
+		if cfg.Endpoint != "http://localhost:8000" {
+			t.Errorf("expected endpoint http://localhost:8000, got %s", cfg.Endpoint)
+		}
+		if cfg.ManagementKey != "my-secret-key" {
+			t.Errorf("expected management key 'my-secret-key', got %s", cfg.ManagementKey)
+		}
+		if cfg.FiveHourThreshold != 90.0 {
+			t.Errorf("expected 5h threshold 90.0, got %.1f", cfg.FiveHourThreshold)
+		}
+		if cfg.WeeklyThreshold != 95.0 {
+			t.Errorf("expected weekly threshold 95.0, got %.1f", cfg.WeeklyThreshold)
+		}
+		if cfg.Provider != config.DefaultProvider {
+			t.Errorf("expected default provider %s, got %s", config.DefaultProvider, cfg.Provider)
+		}
+		if cfg.ActivePrefix != config.DefaultActivePrefix {
+			t.Errorf("expected default active prefix %s, got %s", config.DefaultActivePrefix, cfg.ActivePrefix)
+		}
+		if cfg.ReservePrefixPrefix != config.DefaultReservePrefixPrefix {
+			t.Errorf("expected default reserve prefix %s, got %s", config.DefaultReservePrefixPrefix, cfg.ReservePrefixPrefix)
+		}
+		if cfg.CooldownMinutes != config.DefaultCooldownMinutes {
+			t.Errorf("expected default cooldown %.1f, got %.1f", config.DefaultCooldownMinutes, cfg.CooldownMinutes)
+		}
+	})
+
+	t.Run("custom values for all prompts", func(t *testing.T) {
+		tempDir := t.TempDir()
+		configPath := filepath.Join(tempDir, "config.json")
+
+		input := "http://custom-proxy:9999\ncustom-secret\n85.5\n92.0\n"
+		var out bytes.Buffer
+
+		if err := runInteractiveInitWithIO(configPath, strings.NewReader(input), &out); err != nil {
+			t.Fatalf("runInteractiveInitWithIO failed: %v", err)
+		}
+
+		cfg, _, err := config.Load(configPath)
+		if err != nil {
+			t.Fatalf("failed to load saved config: %v", err)
+		}
+
+		if cfg.Endpoint != "http://custom-proxy:9999" {
+			t.Errorf("expected endpoint http://custom-proxy:9999, got %s", cfg.Endpoint)
+		}
+		if cfg.ManagementKey != "custom-secret" {
+			t.Errorf("expected key 'custom-secret', got %s", cfg.ManagementKey)
+		}
+		if cfg.FiveHourThreshold != 85.5 {
+			t.Errorf("expected 5h threshold 85.5, got %.1f", cfg.FiveHourThreshold)
+		}
+		if cfg.WeeklyThreshold != 92.0 {
+			t.Errorf("expected weekly threshold 92.0, got %.1f", cfg.WeeklyThreshold)
+		}
+	})
+
+	t.Run("empty management key on new config fails", func(t *testing.T) {
+		tempDir := t.TempDir()
+		configPath := filepath.Join(tempDir, "config.json")
+
+		// Empty endpoint, empty management key
+		input := "\n\n\n\n"
+		var out bytes.Buffer
+
+		err := runInteractiveInitWithIO(configPath, strings.NewReader(input), &out)
+		if err == nil {
+			t.Fatal("expected error for empty management key, got nil")
+		}
+		if !strings.Contains(err.Error(), "management key cannot be empty") {
+			t.Errorf("expected 'management key cannot be empty' error, got %v", err)
+		}
+	})
+
+	t.Run("invalid 5h threshold string fails", func(t *testing.T) {
+		tempDir := t.TempDir()
+		configPath := filepath.Join(tempDir, "config.json")
+
+		input := "\nmy-key\nnot-a-number\n"
+		var out bytes.Buffer
+
+		err := runInteractiveInitWithIO(configPath, strings.NewReader(input), &out)
+		if err == nil {
+			t.Fatal("expected error for invalid 5h threshold, got nil")
+		}
+		if !strings.Contains(err.Error(), "invalid 5-hour threshold") {
+			t.Errorf("expected 'invalid 5-hour threshold' error, got %v", err)
+		}
+	})
+
+	t.Run("invalid weekly threshold string fails", func(t *testing.T) {
+		tempDir := t.TempDir()
+		configPath := filepath.Join(tempDir, "config.json")
+
+		input := "\nmy-key\n90.0\nnot-a-number\n"
+		var out bytes.Buffer
+
+		err := runInteractiveInitWithIO(configPath, strings.NewReader(input), &out)
+		if err == nil {
+			t.Fatal("expected error for invalid weekly threshold, got nil")
+		}
+		if !strings.Contains(err.Error(), "invalid weekly threshold") {
+			t.Errorf("expected 'invalid weekly threshold' error, got %v", err)
+		}
+	})
+}
+
+func TestRunInteractiveInitWithIO_ExistingConfig(t *testing.T) {
+	t.Run("preserve existing values when blank inputs given", func(t *testing.T) {
+		tempDir := t.TempDir()
+		configPath := filepath.Join(tempDir, "config.json")
+
+		initialCfg := &config.Config{
+			Endpoint:            "http://proxy.internal:8000",
+			ManagementKey:       "original-key-xyz",
+			Provider:            "codex",
+			ActivePrefix:        "codex_act",
+			ReservePrefixPrefix: "codex_res_",
+			FiveHourThreshold:   82.0,
+			WeeklyThreshold:     88.0,
+			CooldownMinutes:     15.0,
+		}
+		if _, err := initialCfg.Save(configPath); err != nil {
+			t.Fatalf("failed to save initial config: %v", err)
+		}
+
+		// Input: all empty -> press Enter for all prompts
+		input := "\n\n\n\n"
+		var out bytes.Buffer
+
+		if err := runInteractiveInitWithIO(configPath, strings.NewReader(input), &out); err != nil {
+			t.Fatalf("runInteractiveInitWithIO failed: %v", err)
+		}
+
+		outputStr := out.String()
+		if !strings.Contains(outputStr, "Enter CLIProxyAPI endpoint URL [http://proxy.internal:8000]: ") {
+			t.Errorf("expected prompt with existing endpoint, got: %s", outputStr)
+		}
+		if !strings.Contains(outputStr, "Enter management key [leave blank to keep current]: ") {
+			t.Errorf("expected prompt with leave blank option, got: %s", outputStr)
+		}
+		if !strings.Contains(outputStr, "Enter 5-hour threshold percentage [82.0]: ") {
+			t.Errorf("expected prompt with existing 5h threshold 82.0, got: %s", outputStr)
+		}
+		if !strings.Contains(outputStr, "Enter weekly threshold percentage [88.0]: ") {
+			t.Errorf("expected prompt with existing weekly threshold 88.0, got: %s", outputStr)
+		}
+
+		reloadedCfg, _, err := config.Load(configPath)
+		if err != nil {
+			t.Fatalf("failed to load reloaded config: %v", err)
+		}
+
+		if reloadedCfg.Endpoint != "http://proxy.internal:8000" {
+			t.Errorf("expected endpoint preserved, got %s", reloadedCfg.Endpoint)
+		}
+		if reloadedCfg.ManagementKey != "original-key-xyz" {
+			t.Errorf("expected management key preserved, got %s", reloadedCfg.ManagementKey)
+		}
+		if reloadedCfg.FiveHourThreshold != 82.0 {
+			t.Errorf("expected 5h threshold preserved at 82.0, got %.1f", reloadedCfg.FiveHourThreshold)
+		}
+		if reloadedCfg.WeeklyThreshold != 88.0 {
+			t.Errorf("expected weekly threshold preserved at 88.0, got %.1f", reloadedCfg.WeeklyThreshold)
+		}
+		if reloadedCfg.Provider != "codex" {
+			t.Errorf("expected provider 'codex' preserved, got %s", reloadedCfg.Provider)
+		}
+		if reloadedCfg.ActivePrefix != "codex_act" {
+			t.Errorf("expected active prefix 'codex_act' preserved, got %s", reloadedCfg.ActivePrefix)
+		}
+		if reloadedCfg.ReservePrefixPrefix != "codex_res_" {
+			t.Errorf("expected reserve prefix 'codex_res_' preserved, got %s", reloadedCfg.ReservePrefixPrefix)
+		}
+		if reloadedCfg.CooldownMinutes != 15.0 {
+			t.Errorf("expected cooldown minutes 15.0 preserved, got %.1f", reloadedCfg.CooldownMinutes)
+		}
+	})
+
+	t.Run("update values when new inputs provided", func(t *testing.T) {
+		tempDir := t.TempDir()
+		configPath := filepath.Join(tempDir, "config.json")
+
+		initialCfg := &config.Config{
+			Endpoint:            "http://proxy.internal:8000",
+			ManagementKey:       "original-key-xyz",
+			Provider:            "codex",
+			ActivePrefix:        "codex_act",
+			ReservePrefixPrefix: "codex_res_",
+			FiveHourThreshold:   82.0,
+			WeeklyThreshold:     88.0,
+			CooldownMinutes:     15.0,
+		}
+		if _, err := initialCfg.Save(configPath); err != nil {
+			t.Fatalf("failed to save initial config: %v", err)
+		}
+
+		input := "http://updated-proxy:8080\nupdated-key-999\n75.0\n80.0\n"
+		var out bytes.Buffer
+
+		if err := runInteractiveInitWithIO(configPath, strings.NewReader(input), &out); err != nil {
+			t.Fatalf("runInteractiveInitWithIO failed: %v", err)
+		}
+
+		reloadedCfg, _, err := config.Load(configPath)
+		if err != nil {
+			t.Fatalf("failed to load reloaded config: %v", err)
+		}
+
+		if reloadedCfg.Endpoint != "http://updated-proxy:8080" {
+			t.Errorf("expected updated endpoint, got %s", reloadedCfg.Endpoint)
+		}
+		if reloadedCfg.ManagementKey != "updated-key-999" {
+			t.Errorf("expected updated management key, got %s", reloadedCfg.ManagementKey)
+		}
+		if reloadedCfg.FiveHourThreshold != 75.0 {
+			t.Errorf("expected updated 5h threshold 75.0, got %.1f", reloadedCfg.FiveHourThreshold)
+		}
+		if reloadedCfg.WeeklyThreshold != 80.0 {
+			t.Errorf("expected updated weekly threshold 80.0, got %.1f", reloadedCfg.WeeklyThreshold)
+		}
+		// Preserved fields
+		if reloadedCfg.Provider != "codex" {
+			t.Errorf("expected provider 'codex' preserved, got %s", reloadedCfg.Provider)
+		}
+		if reloadedCfg.ActivePrefix != "codex_act" {
+			t.Errorf("expected active prefix 'codex_act' preserved, got %s", reloadedCfg.ActivePrefix)
+		}
+		if reloadedCfg.ReservePrefixPrefix != "codex_res_" {
+			t.Errorf("expected reserve prefix 'codex_res_' preserved, got %s", reloadedCfg.ReservePrefixPrefix)
+		}
+		if reloadedCfg.CooldownMinutes != 15.0 {
+			t.Errorf("expected cooldown minutes 15.0 preserved, got %.1f", reloadedCfg.CooldownMinutes)
+		}
+	})
+}
+
 
