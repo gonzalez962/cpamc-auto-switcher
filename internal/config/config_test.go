@@ -101,3 +101,78 @@ func TestConfigValidation(t *testing.T) {
 		t.Errorf("expected only codex resolved, got %v", cfg.ResolvedProviders())
 	}
 }
+
+func TestConventionForProfile(t *testing.T) {
+	cfg := NewDefaultConfig()
+
+	// Default profile returns base convention
+	act, res := cfg.ConventionForProfile("antigravity", "")
+	if act != "agy" || res != "agy_" {
+		t.Errorf("expected agy/agy_, got %s/%s", act, res)
+	}
+
+	// Profile p1
+	act, res = cfg.ConventionForProfile("antigravity", "p1")
+	if act != "agy_p1" || res != "agy_p1_" {
+		t.Errorf("expected agy_p1/agy_p1_, got %s/%s", act, res)
+	}
+
+	// Codex profile p2
+	act, res = cfg.ConventionForProfile("codex", "p2")
+	if act != "codex_p2" || res != "codex_p2_" {
+		t.Errorf("expected codex_p2/codex_p2_, got %s/%s", act, res)
+	}
+}
+
+func TestParsePrefix(t *testing.T) {
+	tests := []struct {
+		prefix      string
+		baseActive  string
+		wantProfile string
+		wantActive  bool
+		wantReserve bool
+		wantIndex   int
+		wantMatched bool
+	}{
+		// Antigravity default pool
+		{"agy", "agy", "", true, false, 0, true},
+		{"agy_1", "agy", "", false, true, 1, true},
+		{"agy_2", "agy", "", false, true, 2, true},
+		{"agy_10", "agy", "", false, true, 10, true},
+
+		// Antigravity profile p1
+		{"agy_p1", "agy", "p1", true, false, 0, true},
+		{"agy_p1_1", "agy", "p1", false, true, 1, true},
+		{"agy_p1_2", "agy", "p1", false, true, 2, true},
+
+		// Antigravity profile with underscore e.g. team_a
+		{"agy_team_a", "agy", "team_a", true, false, 0, true},
+		{"agy_team_a_1", "agy", "team_a", false, true, 1, true},
+
+		// Codex default pool
+		{"codex", "codex", "", true, false, 0, true},
+		{"codex_1", "codex", "", false, true, 1, true},
+
+		// Codex profile p2
+		{"codex_p2", "codex", "p2", true, false, 0, true},
+		{"codex_p2_1", "codex", "p2", false, true, 1, true},
+
+		// Unmatched
+		{"other", "agy", "", false, false, 0, false},
+		{"", "agy", "", false, false, 0, false},
+		{"agy_", "agy", "", false, false, 0, false},
+	}
+
+	for _, tc := range tests {
+		got := ParsePrefix(tc.prefix, tc.baseActive)
+		if got.Matched != tc.wantMatched ||
+			got.Profile != tc.wantProfile ||
+			got.IsActive != tc.wantActive ||
+			got.IsReserve != tc.wantReserve ||
+			got.ReserveIndex != tc.wantIndex {
+			t.Errorf("ParsePrefix(%q, %q) = %+v; want Matched=%v, Profile=%q, IsActive=%v, IsReserve=%v, Index=%d",
+				tc.prefix, tc.baseActive, got, tc.wantMatched, tc.wantProfile, tc.wantActive, tc.wantReserve, tc.wantIndex)
+		}
+	}
+}
+

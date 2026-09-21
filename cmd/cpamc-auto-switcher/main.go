@@ -66,6 +66,7 @@ func main() {
 	initFlag := flag.Bool("init", false, "Initialize or update credentials configuration interactively")
 	listFlag := flag.Bool("list", false, "List all accounts, their prefix, and current quota usage")
 	providerFlag := flag.String("provider", "", "Target provider to evaluate (antigravity, codex, or all; default from config or 'all')")
+	profileFlag := flag.String("profile", "", "Filter accounts or evaluation by profile (e.g. 'p1', or 'default' for unprofiled)")
 	switchFlag := flag.String("switch", "", "Manually promote specified account (by prefix, ID, filename, or email) to active")
 	checkFlag := flag.Bool("check", false, "Check quotas and evaluate rotation without modifying prefixes (dry-run)")
 	dryRunFlag := flag.Bool("dry-run", false, "Alias for --check")
@@ -116,6 +117,9 @@ func main() {
 	if *verboseFlag {
 		fmt.Printf("[INFO] Using endpoint: %s\n", cfg.Endpoint)
 		fmt.Printf("[INFO] Target provider(s): %v\n", cfg.ResolvedProviders())
+		if strings.TrimSpace(*profileFlag) != "" {
+			fmt.Printf("[INFO] Target profile: %s\n", strings.TrimSpace(*profileFlag))
+		}
 		fmt.Printf("[INFO] Thresholds: 5-Hour >= %.1f%% | Weekly >= %.1f%%\n", cfg.FiveHourThreshold, cfg.WeeklyThreshold)
 	}
 
@@ -170,13 +174,34 @@ func main() {
 			os.Exit(1)
 		}
 
+		if strings.TrimSpace(*profileFlag) != "" {
+			targetProf := strings.TrimSpace(*profileFlag)
+			var filtered []switcher.AccountState
+			for _, acc := range accounts {
+				match := false
+				if strings.EqualFold(targetProf, "default") {
+					match = (acc.Profile == "" || strings.EqualFold(acc.Profile, "default"))
+				} else {
+					match = strings.EqualFold(acc.Profile, targetProf)
+				}
+				if match {
+					filtered = append(filtered, acc)
+				}
+			}
+			accounts = filtered
+		}
+
 		if len(accounts) == 0 {
-			fmt.Printf("No accounts found for provider(s) %v\n", cfg.ResolvedProviders())
+			if strings.TrimSpace(*profileFlag) != "" {
+				fmt.Printf("No accounts found for provider(s) %v with profile %q\n", cfg.ResolvedProviders(), *profileFlag)
+			} else {
+				fmt.Printf("No accounts found for provider(s) %v\n", cfg.ResolvedProviders())
+			}
 			return
 		}
 
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-		fmt.Fprintln(w, "STATUS\tPROVIDER\tACCOUNT ID\tPREFIX\t5H CONSUMED\tWEEKLY CONSUMED\tMIN AVAILABLE")
+		fmt.Fprintln(w, "STATUS\tPROVIDER\tPROFILE\tACCOUNT ID\tPREFIX\t5H CONSUMED\tWEEKLY CONSUMED\tMIN AVAILABLE")
 
 		for _, acc := range accounts {
 			statusTag := "[RESERVE]"
@@ -187,6 +212,11 @@ func main() {
 			}
 			if acc.Entry.Disabled {
 				statusTag = "[DISABLED]"
+			}
+
+			profileDisplay := acc.Profile
+			if profileDisplay == "" {
+				profileDisplay = "default"
 			}
 
 			fiveHStr := "N/A"
@@ -209,9 +239,10 @@ func main() {
 
 			accountDisplay := abbreviateEmail(extractAccountEmail(acc.Entry.ID, acc.Entry.Name, acc.Entry.Email))
 
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 				statusTag,
 				acc.Entry.Provider,
+				profileDisplay,
 				accountDisplay,
 				acc.Prefix,
 				fiveHStr,
@@ -244,7 +275,12 @@ func main() {
 		return
 	}
 
-	res, err := sw.Run(ctx, isDryRun)
+	var res *switcher.SwitchResult
+	if strings.TrimSpace(*profileFlag) != "" {
+		res, err = sw.Run(ctx, isDryRun, strings.TrimSpace(*profileFlag))
+	} else {
+		res, err = sw.Run(ctx, isDryRun)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Switcher execution failed: %v\n", err)
 		os.Exit(1)

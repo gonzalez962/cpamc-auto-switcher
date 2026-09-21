@@ -282,3 +282,171 @@ func TestAccountDisplayAbbreviationEndToEnd(t *testing.T) {
 		t.Fatalf("abbreviateEmail(%q) = %q, expected %q", raw, display, expected)
 	}
 }
+
+func TestProfileListingAndFiltering(t *testing.T) {
+	prefixes := map[string]string{
+		"acc-def.json": "agy",
+		"acc-res.json": "agy_1",
+		"acc-p1.json":  "agy_p1",
+		"acc-p2.json":  "agy_p1_1",
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v0/management/auth-files":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"files": []map[string]any{
+					{"id": "acc-def", "name": "acc-def.json", "auth_index": "1", "provider": "antigravity"},
+					{"id": "acc-res", "name": "acc-res.json", "auth_index": "2", "provider": "antigravity"},
+					{"id": "acc-p1", "name": "acc-p1.json", "auth_index": "3", "provider": "antigravity"},
+					{"id": "acc-p2", "name": "acc-p2.json", "auth_index": "4", "provider": "antigravity"},
+				},
+			})
+		case "/v0/management/auth-files/download":
+			name := r.URL.Query().Get("name")
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"prefix": prefixes[name]})
+		case "/v0/management/api-call":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"groups":[{"buckets":[{"displayName":"5-Hour Limit","remainingFraction":0.80}]}]}`))
+		}
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		Endpoint:      server.URL,
+		ManagementKey: "dummy",
+		Provider:      "antigravity",
+	}
+	cli, _ := client.New(server.URL, "dummy")
+	sw := switcher.New(cfg, cli)
+
+	accounts, err := sw.ListAccounts(context.Background())
+	if err != nil {
+		t.Fatalf("ListAccounts failed: %v", err)
+	}
+	if len(accounts) != 4 {
+		t.Fatalf("expected 4 accounts, got %d", len(accounts))
+	}
+
+	// Filter by profile "p1"
+	var p1Accounts []switcher.AccountState
+	for _, a := range accounts {
+		if a.Profile == "p1" {
+			p1Accounts = append(p1Accounts, a)
+		}
+	}
+	if len(p1Accounts) != 2 {
+		t.Fatalf("expected 2 accounts in p1, got %d", len(p1Accounts))
+	}
+	if !p1Accounts[0].IsActive || p1Accounts[0].Prefix != "agy_p1" {
+		t.Errorf("expected active p1 first, got %+v", p1Accounts[0])
+	}
+	if !p1Accounts[1].IsReserve || p1Accounts[1].Prefix != "agy_p1_1" {
+		t.Errorf("expected reserve p1 second, got %+v", p1Accounts[1])
+	}
+
+	// Filter by profile "default" ("")
+	var defAccounts []switcher.AccountState
+	for _, a := range accounts {
+		if a.Profile == "" {
+			defAccounts = append(defAccounts, a)
+		}
+	}
+	if len(defAccounts) != 2 {
+		t.Fatalf("expected 2 default accounts, got %d", len(defAccounts))
+	}
+	if !defAccounts[0].IsActive || defAccounts[0].Prefix != "agy" {
+		t.Errorf("expected active default first, got %+v", defAccounts[0])
+	}
+}
+
+func TestProfileSwitchAndRotationIntegration(t *testing.T) {
+	prefixes := map[string]string{
+		"def.json":  "agy",
+		"def1.json": "agy_1",
+		"p1a.json":  "agy_p1",
+		"p1r.json":  "agy_p1_1",
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v0/management/auth-files":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"files": []map[string]any{
+					{"id": "def", "name": "def.json", "auth_index": "1", "provider": "antigravity"},
+					{"id": "def1", "name": "def1.json", "auth_index": "2", "provider": "antigravity"},
+					{"id": "p1a", "name": "p1a.json", "auth_index": "3", "provider": "antigravity"},
+					{"id": "p1r", "name": "p1r.json", "auth_index": "4", "provider": "antigravity"},
+				},
+			})
+		case "/v0/management/auth-files/download":
+			name := r.URL.Query().Get("name")
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"prefix": prefixes[name]})
+		case "/v0/management/auth-files/fields":
+			var req map[string]string
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			prefixes[req["name"]] = req["prefix"]
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		case "/v0/management/api-call":
+			var req client.APICallRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			w.Header().Set("Content-Type", "application/json")
+			switch req.AuthIndex {
+			case "1", "2", "4":
+				_, _ = w.Write([]byte(`{"groups":[{"buckets":[{"displayName":"5-Hour Limit","remainingFraction":0.90}]}]}`))
+			case "3":
+				// p1 active exceeds threshold (95% used)
+				_, _ = w.Write([]byte(`{"groups":[{"buckets":[{"displayName":"5-Hour Limit","remainingFraction":0.05}]}]}`))
+			}
+		}
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		Endpoint:          server.URL,
+		ManagementKey:     "dummy",
+		Provider:          "antigravity",
+		FiveHourThreshold: 90.0,
+		WeeklyThreshold:   95.0,
+	}
+	cli, _ := client.New(server.URL, "dummy")
+	sw := switcher.New(cfg, cli)
+
+	// 1. Manual switch within p1
+	manRes, err := sw.SwitchToAccount(context.Background(), "agy_p1_1", false)
+	if err != nil {
+		t.Fatalf("manual switch failed: %v", err)
+	}
+	if !manRes.Rotated {
+		t.Fatalf("expected manual switch rotation")
+	}
+	if prefixes["p1r.json"] != "agy_p1" || prefixes["p1a.json"] != "agy_p1_1" {
+		t.Fatalf("unexpected prefixes after manual switch: %+v", prefixes)
+	}
+
+	// Reset prefixes for automatic rotation test
+	prefixes["p1a.json"] = "agy_p1"
+	prefixes["p1r.json"] = "agy_p1_1"
+
+	// 2. Automatic rotation filtering by profile "p1"
+	rotRes, err := sw.Run(context.Background(), false, "p1")
+	if err != nil {
+		t.Fatalf("sw.Run failed: %v", err)
+	}
+	if !rotRes.Rotated {
+		t.Fatalf("expected rotation for p1: %s", rotRes.Reason)
+	}
+	if prefixes["p1r.json"] != "agy_p1" || prefixes["p1a.json"] != "agy_p1_1" {
+		t.Fatalf("unexpected prefixes after auto rotation: %+v", prefixes)
+	}
+	// Verify default pool was untouched
+	if prefixes["def.json"] != "agy" || prefixes["def1.json"] != "agy_1" {
+		t.Fatalf("default pool modified: %+v", prefixes)
+	}
+}
+
