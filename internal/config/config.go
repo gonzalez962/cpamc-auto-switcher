@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
 // Default settings
 const (
+	DefaultEndpoint            = "http://localhost:8317"
 	DefaultProvider            = "all"
 	DefaultActivePrefix        = "agy"
 	DefaultReservePrefixPrefix = "agy_"
@@ -87,7 +89,128 @@ func (c *Config) ConventionForProvider(provider string) (activePrefix, reservePr
 	}
 }
 
-// Load reads and parses configuration from the given path. If path is empty,
+// ParsedPrefix contains the structured decomposition of an account prefix.
+type ParsedPrefix struct {
+	BasePrefix   string
+	Profile      string
+	IsActive     bool
+	IsReserve    bool
+	ReserveIndex int
+	Matched      bool
+}
+
+// ParsePrefix parses an account prefix given the base active prefix for the provider.
+// E.g. for baseActive "agy":
+// - "agy" -> default pool active (Profile: "", IsActive: true)
+// - "agy_1" -> default pool reserve 1 (Profile: "", IsReserve: true, ReserveIndex: 1)
+// - "agy_p1" -> profile p1 active (Profile: "p1", IsActive: true)
+// - "agy_p1_1" -> profile p1 reserve 1 (Profile: "p1", IsReserve: true, ReserveIndex: 1)
+// - "agy_team_a" -> profile team_a active (Profile: "team_a", IsActive: true)
+// - "agy_team_a_1" -> profile team_a reserve 1 (Profile: "team_a", IsReserve: true, ReserveIndex: 1)
+func ParsePrefix(prefix, baseActive string) ParsedPrefix {
+	if baseActive == "" || prefix == "" {
+		return ParsedPrefix{}
+	}
+
+	if prefix == baseActive {
+		return ParsedPrefix{
+			BasePrefix:   baseActive,
+			Profile:      "",
+			IsActive:     true,
+			IsReserve:    false,
+			ReserveIndex: 0,
+			Matched:      true,
+		}
+	}
+
+	prefixWithUnder := baseActive + "_"
+	if !strings.HasPrefix(prefix, prefixWithUnder) {
+		return ParsedPrefix{}
+	}
+
+	remainder := strings.TrimPrefix(prefix, prefixWithUnder)
+	if remainder == "" || strings.HasPrefix(remainder, "_") || strings.HasSuffix(remainder, "_") {
+		return ParsedPrefix{}
+	}
+
+	isDigits := func(s string) bool {
+		if len(s) == 0 {
+			return false
+		}
+		for _, r := range s {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+		return true
+	}
+
+	lastIdx := strings.LastIndex(remainder, "_")
+	if lastIdx != -1 {
+		tail := remainder[lastIdx+1:]
+		if isDigits(tail) {
+			idx, err := strconv.Atoi(tail)
+			if err == nil && idx >= 0 {
+				profilePart := remainder[:lastIdx]
+				if profilePart != "" && !strings.HasSuffix(profilePart, "_") {
+					return ParsedPrefix{
+						BasePrefix:   baseActive,
+						Profile:      profilePart,
+						IsActive:     false,
+						IsReserve:    true,
+						ReserveIndex: idx,
+						Matched:      true,
+					}
+				}
+			}
+		}
+		// If tail is not pure digits, the remainder itself is a profile with underscores (e.g. team_a)
+		return ParsedPrefix{
+			BasePrefix:   baseActive,
+			Profile:      remainder,
+			IsActive:     true,
+			IsReserve:    false,
+			ReserveIndex: 0,
+			Matched:      true,
+		}
+	}
+
+	// No underscores in remainder
+	if isDigits(remainder) {
+		idx, err := strconv.Atoi(remainder)
+		if err == nil && idx >= 0 {
+			return ParsedPrefix{
+				BasePrefix:   baseActive,
+				Profile:      "",
+				IsActive:     false,
+				IsReserve:    true,
+				ReserveIndex: idx,
+				Matched:      true,
+			}
+		}
+	}
+
+	return ParsedPrefix{
+		BasePrefix:   baseActive,
+		Profile:      remainder,
+		IsActive:     true,
+		IsReserve:    false,
+		ReserveIndex: 0,
+		Matched:      true,
+	}
+}
+
+// ConventionForProfile resolves active and reserve prefixes for the specified provider and profile.
+func (c *Config) ConventionForProfile(provider, profile string) (activePrefix, reservePrefixPrefix string) {
+	baseActive, baseReserve := c.ConventionForProvider(provider)
+	trimmedProfile := strings.TrimSpace(profile)
+	if trimmedProfile == "" {
+		return baseActive, baseReserve
+	}
+	active := fmt.Sprintf("%s_%s", baseActive, trimmedProfile)
+	return active, active + "_"
+}
+
 // DefaultConfigPath is used.
 func Load(customPath string) (*Config, string, error) {
 	path := customPath
