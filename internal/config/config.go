@@ -12,6 +12,7 @@ import (
 
 // Default settings
 const (
+	DefaultEndpoint            = "http://localhost:8317"
 	DefaultProvider            = "all"
 	DefaultActivePrefix        = "agy"
 	DefaultReservePrefixPrefix = "agy_"

@@ -51,7 +51,7 @@ cpamc-auto-switcher -init
 ```
 
 The interactive wizard supports both initial setup and updating existing configurations:
-- **Endpoint URL**: Displays the current endpoint (or `http://localhost:8000` by default). Pressing Enter retains the current endpoint.
+- **Endpoint URL**: Displays the current endpoint (or `http://localhost:8317` by default). Pressing Enter retains the current endpoint.
 - **Management Key**: If a key is already saved, displays `[leave blank to keep current]`; pressing Enter keeps the existing key. On first-time setup, a non-empty key is required.
 - **5-Hour Threshold**: Displays the current or default percentage (default `90.0`). Pressing Enter keeps the default, or enter a custom float.
 - **Weekly Threshold**: Displays the current or default percentage (default `95.0`). Pressing Enter keeps the default, or enter a custom float.
@@ -63,7 +63,7 @@ Default config file location:
 Example configuration:
 ```json
 {
-  "endpoint": "http://localhost:8000",
+  "endpoint": "http://localhost:8317",
   "management_key": "YOUR_MANAGEMENT_KEY",
   "provider": "antigravity",
   "active_prefix": "agy",

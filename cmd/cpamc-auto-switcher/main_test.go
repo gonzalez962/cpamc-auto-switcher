@@ -621,7 +621,7 @@ func TestRunInteractiveInitWithIO_NewConfig(t *testing.T) {
 		}
 
 		outputStr := out.String()
-		if !strings.Contains(outputStr, "Enter CLIProxyAPI endpoint URL [http://localhost:8000]: ") {
+		if !strings.Contains(outputStr, "Enter CLIProxyAPI endpoint URL [http://localhost:8317]: ") {
 			t.Errorf("expected default endpoint prompt, got: %s", outputStr)
 		}
 		if !strings.Contains(outputStr, "Enter management key: ") {
@@ -639,8 +639,8 @@ func TestRunInteractiveInitWithIO_NewConfig(t *testing.T) {
 			t.Fatalf("failed to load saved config: %v", err)
 		}
 
-		if cfg.Endpoint != "http://localhost:8000" {
-			t.Errorf("expected endpoint http://localhost:8000, got %s", cfg.Endpoint)
+		if cfg.Endpoint != "http://localhost:8317" {
+			t.Errorf("expected endpoint http://localhost:8317, got %s", cfg.Endpoint)
 		}
 		if cfg.ManagementKey != "my-secret-key" {
 			t.Errorf("expected management key 'my-secret-key', got %s", cfg.ManagementKey)

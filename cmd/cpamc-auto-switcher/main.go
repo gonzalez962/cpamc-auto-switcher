@@ -73,7 +73,7 @@ func main() {
 	switchFlag := flag.String("switch", "", "Manually promote specified account (by prefix, ID, filename, or email) to active")
 	checkFlag := flag.Bool("check", false, "Check quotas and evaluate rotation without modifying prefixes (dry-run)")
 	dryRunFlag := flag.Bool("dry-run", false, "Alias for --check")
-	endpointFlag := flag.String("endpoint", "", "Override API endpoint (e.g. http://localhost:8000)")
+	endpointFlag := flag.String("endpoint", "", "Override API endpoint (e.g. http://localhost:8317)")
 	keyFlag := flag.String("key", "", "Override management key")
 	verboseFlag := flag.Bool("verbose", false, "Enable detailed logging")
 	forceFlag := flag.Bool("force", false, "Bypass cooldown timeout and force quota evaluation immediately")
@@ -364,7 +364,7 @@ func runInteractiveInitWithIO(customPath string, r io.Reader, w io.Writer) error
 	fmt.Fprintln(w, "=== cpamc-auto-switcher configuration setup ===")
 
 	// 1. Endpoint
-	defaultEndpoint := "http://localhost:8000"
+	defaultEndpoint := config.DefaultEndpoint
 	if strings.TrimSpace(cfg.Endpoint) != "" {
 		defaultEndpoint = strings.TrimSpace(cfg.Endpoint)
 	}
