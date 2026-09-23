@@ -215,4 +215,29 @@ describe('ProfileNode Component - Inline Editing & Dirty State', () => {
       screen.getByText('Cannot rename parent with attached children. Disconnect children first.')
     ).toBeTruthy();
   });
+
+  it('visibly explains ambiguous parent prefix without guessing relation', () => {
+    renderInProvider(
+      <ProfileNode
+        id="child-ambig.json"
+        data={{
+          prefix: 'agy_p1_1',
+          label: 'agy_p1_1',
+          isRoot: false,
+          ambiguousParent: {
+            parentPrefix: 'agy_p1',
+            candidateCount: 2,
+            candidateNames: ['acc1.json', 'acc2.json'],
+          },
+        }}
+        isConnectable={true}
+      />
+    );
+
+    // Verifies badge and footer notice visibly explain ambiguity without guessing parent
+    expect(screen.getByTestId('badge-ambiguous-child-ambig.json')).toBeTruthy();
+    expect(screen.getByText('AMBIGUOUS PARENT')).toBeTruthy();
+    expect(screen.getByTestId('ambiguity-notice-child-ambig.json')).toBeTruthy();
+    expect(screen.getByText(/Multiple accounts share/)).toBeTruthy();
+  });
 });

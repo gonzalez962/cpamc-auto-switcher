@@ -116,22 +116,21 @@ const ProfileGraph = forwardRef(function ProfileGraph(
 
   const { nodes, edges } = graphState;
 
+  // Keep synchronous ref to freshest graph state for async baseline synchronization
+  const graphStateRef = useRef(graphState);
+  graphStateRef.current = graphState;
+
   // Save changes state and overlap guard
   const [isSaving, setIsSaving] = useState(false);
   const isSavingRef = useRef(false);
 
-  // Maintain clean baseline to prevent Reset from reverting to stale initial props after save
+  // Maintain clean baseline to prevent Reset from reverting to stale initial props after save.
+  // Initialized on mount from initial dataset; updated on successful save or dataset remount.
+  // NOTE: Avoid syncing from safeInitialNodes in an effect to prevent re-clobbering saved baseline on rerender.
   const currentBaselineRef = useRef({
     nodes: safeInitialNodes,
     edges: safeInitialEdges,
   });
-
-  useEffect(() => {
-    currentBaselineRef.current = {
-      nodes: safeInitialNodes,
-      edges: safeInitialEdges,
-    };
-  }, [safeInitialNodes, safeInitialEdges]);
   const [saveState, setSaveState] = useState({
     status: 'idle', // 'idle' | 'saving' | 'success' | 'partial' | 'error'
     message: '',
@@ -307,7 +306,9 @@ const ProfileGraph = forwardRef(function ProfileGraph(
         onGraphChange();
       }
 
-      // Update baseline nodes with newly saved prefixes to prevent Reset from reverting to stale initial props
+      // Update baseline nodes with newly saved prefixes to prevent Reset from reverting to stale initial props.
+      // Must be built from freshest graph state (graphStateRef.current), not stale closure values,
+      // preserving in-flight edge changes and latest draft edits.
       if (successful.length > 0) {
         const savedMap = new Map();
         successful.forEach((item) => {
@@ -316,8 +317,9 @@ const ProfileGraph = forwardRef(function ProfileGraph(
           }
         });
 
+        const latestState = graphStateRef.current || { nodes, edges };
         currentBaselineRef.current = {
-          nodes: currentBaselineRef.current.nodes.map((node) => {
+          nodes: latestState.nodes.map((node) => {
             const fileKey = node.data?.fileName || node.id;
             if (savedMap.has(fileKey)) {
               const newPrefix = savedMap.get(fileKey);
@@ -334,7 +336,8 @@ const ProfileGraph = forwardRef(function ProfileGraph(
             }
             return node;
           }),
-          edges: [...edges],
+          // FRESHEST edges, preserving in-flight edge connections/disconnections during the async save
+          edges: [...latestState.edges],
         };
       }
 

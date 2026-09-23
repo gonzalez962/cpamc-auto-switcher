@@ -377,6 +377,16 @@ body, html {
   border: 1px solid #d29922;
 }
 
+.badge-ambiguous {
+  background-color: rgba(219, 109, 40, 0.2);
+  color: #f0883e;
+  border: 1px solid #db6d28;
+}
+
+.profile-node-ambiguous-footer {
+  border-top: 1px dashed rgba(219, 109, 40, 0.4);
+}
+
 .badge-live-auth {
   font-size: 11px;
   padding: 2px 8px;

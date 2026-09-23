@@ -11,6 +11,7 @@ export default function App() {
   const [status, setStatus] = useState('loading'); // 'loading' | 'unauthenticated' | 'ready' | 'error' | 'demo'
   const [errorMessage, setErrorMessage] = useState('');
   const [graphData, setGraphData] = useState({ nodes: [], edges: [] });
+  const [datasetVersion, setDatasetVersion] = useState(0);
   const graphRef = useRef(null);
 
   const loadProfiles = useCallback(async () => {
@@ -27,6 +28,7 @@ export default function App() {
       const authFiles = await loadAuthFilesWithPrefixes({ key });
       const { nodes, edges } = buildGraphFromAuthFiles(authFiles);
       setGraphData({ nodes, edges });
+      setDatasetVersion((v) => v + 1);
       setStatus('ready');
     } catch (err) {
       // Never expose raw secrets or token material in error state
@@ -196,7 +198,7 @@ export default function App() {
         {status === 'ready' && (
           <ProfileGraph
             ref={graphRef}
-            key="live-graph"
+            key={`live-graph-${datasetVersion}`}
             initialNodes={graphData.nodes}
             initialEdges={graphData.edges}
             allowSynthetic={false}

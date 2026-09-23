@@ -494,9 +494,10 @@ export function buildGraphFromAuthFiles(authFiles = []) {
 
   const edges = [];
   const childNodeIds = new Set();
+  const ambiguousChildMap = new Map();
 
   // Identify relationships where child prefix matches parent prefix + '_N'
-  // When duplicate parent prefix exists, graph inference must NOT invent parent edge (leave ambiguous nodes disconnected)
+  // When duplicate parent prefix exists, graph inference must NOT invent parent edge (leave ambiguous nodes disconnected and visibly explain)
   cleanFiles.forEach((file) => {
     const childPrefix = file.prefix;
     if (!childPrefix) return;
@@ -518,6 +519,13 @@ export function buildGraphFromAuthFiles(authFiles = []) {
             style: { stroke: '#58a6ff', strokeWidth: 2 },
           });
         }
+      } else if (candidateParents.length > 1) {
+        // Multiple candidate parents share candidateParentPrefix: leave disconnected and record ambiguity info
+        ambiguousChildMap.set(file.name, {
+          parentPrefix: candidateParentPrefix,
+          candidateCount: candidateParents.length,
+          candidateNames: candidateParents.map((p) => p.name),
+        });
       }
     }
   });
@@ -528,6 +536,7 @@ export function buildGraphFromAuthFiles(authFiles = []) {
     const prefix = file.prefix;
     const isChild = childNodeIds.has(fileName);
     const isRoot = !isChild && Boolean(prefix);
+    const ambiguousParent = ambiguousChildMap.get(fileName) || null;
 
     // Layout in grid: roots on top rows, children on lower rows
     const col = idx % 4;
@@ -549,6 +558,7 @@ export function buildGraphFromAuthFiles(authFiles = []) {
         isDirty: false,
         isRoot,
         isSynthetic: false, // Real auth-file node
+        ambiguousParent,
       },
     };
   });

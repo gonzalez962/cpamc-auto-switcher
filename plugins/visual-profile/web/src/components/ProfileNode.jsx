@@ -43,6 +43,7 @@ function ProfileNode({ id, data, isConnectable }) {
   const isDirty = Boolean(data?.isDirty);
   const outgoingCount = data?.outgoingCount ?? 0;
   const fileName = data?.fileName;
+  const ambiguousParent = data?.ambiguousParent;
 
   const [isEditing, setIsEditing] = useState(false);
   const [editValue, setEditValue] = useState(currentPrefix || '');
@@ -122,6 +123,17 @@ function ProfileNode({ id, data, isConnectable }) {
           {isDirty && (
             <span className="profile-badge badge-dirty" data-testid={`badge-dirty-${id}`}>
               DIRTY
+            </span>
+          )}
+          {ambiguousParent && (
+            <span
+              className="profile-badge badge-ambiguous"
+              title={`Ambiguous parent: multiple accounts (${ambiguousParent.candidateNames.join(
+                ', '
+              )}) share prefix "${ambiguousParent.parentPrefix}". Parent relation left disconnected.`}
+              data-testid={`badge-ambiguous-${id}`}
+            >
+              AMBIGUOUS PARENT
             </span>
           )}
         </div>
@@ -217,6 +229,21 @@ function ProfileNode({ id, data, isConnectable }) {
         <div className="profile-node-footer">
           <span className="profile-node-subtext">
             {outgoingCount} {outgoingCount === 1 ? 'child' : 'children'}
+          </span>
+        </div>
+      )}
+
+      {/* Visibly explain ambiguous parent relation without guessing */}
+      {ambiguousParent && (
+        <div
+          className="profile-node-footer profile-node-ambiguous-footer"
+          data-testid={`ambiguity-notice-${id}`}
+        >
+          <span
+            className="profile-node-subtext text-warning"
+            title={`Candidates: ${ambiguousParent.candidateNames.join(', ')}`}
+          >
+            Multiple accounts share &ldquo;{ambiguousParent.parentPrefix}&rdquo; (disconnected)
           </span>
         </div>
       )}

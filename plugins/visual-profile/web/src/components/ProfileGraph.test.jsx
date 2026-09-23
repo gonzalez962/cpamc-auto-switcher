@@ -1014,5 +1014,194 @@ describe('ProfileGraph Component and onConnect Integration', () => {
       // No network calls on keystrokes
       expect(mockFetch).not.toHaveBeenCalled();
     });
+
+    it('regression: rerender saved graph preserves saved baseline and does not re-clobber to stale initial props on reset', async () => {
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true }),
+      });
+
+      const initialNodes = [
+        {
+          id: 'acc1.json',
+          type: 'profile',
+          position: { x: 50, y: 50 },
+          data: {
+            prefix: 'orig_prefix',
+            initialPrefix: 'orig_prefix',
+            label: 'orig_prefix',
+            fileName: 'acc1.json',
+            isRoot: true,
+            isDirty: false,
+            isSynthetic: false,
+          },
+        },
+      ];
+
+      const graphRef = React.createRef();
+      const { rerender } = render(
+        <ProfileGraph
+          ref={graphRef}
+          initialNodes={initialNodes}
+          initialEdges={[]}
+          allowSynthetic={false}
+          apiOptions={{ key: 'test-key', fetchFn: mockFetch }}
+        />
+      );
+
+      // Save a new prefix
+      fireEvent.click(screen.getByTestId('btn-edit-prefix-acc1.json'));
+      fireEvent.change(screen.getByTestId('input-prefix-acc1.json'), {
+        target: { value: 'saved_prefix' },
+      });
+      fireEvent.click(screen.getByTestId('btn-save-prefix-acc1.json'));
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('btn-save-changes'));
+      });
+      expect(screen.getByTestId('save-status-success')).toBeTruthy();
+
+      // Parent rerenders with fresh reference to initialNodes
+      rerender(
+        <ProfileGraph
+          ref={graphRef}
+          initialNodes={[...initialNodes]}
+          initialEdges={[]}
+          allowSynthetic={false}
+          apiOptions={{ key: 'test-key', fetchFn: mockFetch }}
+        />
+      );
+
+      // Edit node again after rerender
+      fireEvent.click(screen.getByTestId('btn-edit-prefix-acc1.json'));
+      fireEvent.change(screen.getByTestId('input-prefix-acc1.json'), {
+        target: { value: 'dirty_after_rerender' },
+      });
+      fireEvent.click(screen.getByTestId('btn-save-prefix-acc1.json'));
+      expect(screen.getByText('dirty_after_rerender')).toBeTruthy();
+
+      // Reset graph: must NOT re-clobber to orig_prefix from initial props
+      fireEvent.click(screen.getByTestId('btn-reset-graph'));
+
+      expect(screen.getByText('saved_prefix')).toBeTruthy();
+      expect(screen.queryByText('orig_prefix')).toBeNull();
+      expect(graphRef.current.isDirty()).toBe(false);
+    });
+
+    it('regression: in-flight edge changes are captured in baseline during async save', async () => {
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      let resolveSave;
+      const savePromise = new Promise((resolve) => {
+        resolveSave = resolve;
+      });
+      const mockFetch = vi.fn().mockReturnValue(
+        savePromise.then(() => ({
+          ok: true,
+          status: 200,
+          json: async () => ({ ok: true }),
+        }))
+      );
+
+      const nodes = [
+        {
+          id: 'p1.json',
+          type: 'profile',
+          position: { x: 50, y: 50 },
+          data: {
+            prefix: 'p1_init',
+            initialPrefix: 'p1_init',
+            label: 'p1_init',
+            fileName: 'p1.json',
+            isRoot: true,
+            isDirty: false,
+            isSynthetic: false,
+          },
+        },
+        {
+          id: 'c1.json',
+          type: 'profile',
+          position: { x: 50, y: 250 },
+          data: {
+            prefix: '',
+            initialPrefix: '',
+            label: 'c1.json',
+            fileName: 'c1.json',
+            isRoot: false,
+            isDirty: false,
+            isSynthetic: false,
+          },
+        },
+        {
+          id: 'other.json',
+          type: 'profile',
+          position: { x: 250, y: 50 },
+          data: {
+            prefix: 'other_init',
+            initialPrefix: 'other_init',
+            label: 'other_init',
+            fileName: 'other.json',
+            isRoot: true,
+            isDirty: false,
+            isSynthetic: false,
+          },
+        },
+      ];
+
+      const graphRef = React.createRef();
+      render(
+        <ProfileGraph
+          ref={graphRef}
+          initialNodes={nodes}
+          initialEdges={[]}
+          allowSynthetic={false}
+          apiOptions={{ key: 'test-key', fetchFn: mockFetch }}
+        />
+      );
+
+      // Edit p1 and trigger save
+      fireEvent.click(screen.getByTestId('btn-edit-prefix-p1.json'));
+      fireEvent.change(screen.getByTestId('input-prefix-p1.json'), {
+        target: { value: 'p1_saved' },
+      });
+      fireEvent.click(screen.getByTestId('btn-save-prefix-p1.json'));
+
+      act(() => {
+        fireEvent.click(screen.getByTestId('btn-save-changes'));
+      });
+      expect(graphRef.current.isSaving()).toBe(true);
+
+      // WHILE SAVE IS IN FLIGHT: connect p1 -> c1
+      act(() => {
+        graphRef.current.connect({ source: 'p1.json', target: 'c1.json' });
+      });
+      expect(graphRef.current.getEdges().length).toBe(1);
+
+      // Resolve save
+      await act(async () => {
+        resolveSave();
+      });
+      expect(graphRef.current.isSaving()).toBe(false);
+
+      // Make a temporary prefix edit on other.json
+      fireEvent.click(screen.getByTestId('btn-edit-prefix-other.json'));
+      fireEvent.change(screen.getByTestId('input-prefix-other.json'), {
+        target: { value: 'other_dirty' },
+      });
+      fireEvent.click(screen.getByTestId('btn-save-prefix-other.json'));
+      expect(screen.getByText('other_dirty')).toBeTruthy();
+      expect(graphRef.current.isDirty()).toBe(true);
+
+      // Reset graph: baseline MUST retain the in-flight edge connection p1 -> c1
+      fireEvent.click(screen.getByTestId('btn-reset-graph'));
+
+      expect(graphRef.current.getEdges().length).toBe(1);
+      expect(graphRef.current.getEdges()[0].source).toBe('p1.json');
+      expect(graphRef.current.getEdges()[0].target).toBe('c1.json');
+      expect(screen.getByText('p1_saved')).toBeTruthy();
+      expect(screen.getByText('other_init')).toBeTruthy();
+      expect(screen.queryByText('other_dirty')).toBeNull();
+    });
   });
 });

@@ -30,7 +30,12 @@ The `visual-profile` plugin integrates with the CLIProxyAPI host via C-ABI versi
   - *Functional Compatibility*: Functional `setNodes` and `setEdges` adapter wrappers are retained for React Flow event compatibility (`applyNodeChanges`, `applyEdgeChanges`).
 - **Derived Outgoing Counts**:
   - Outgoing child counts displayed in node footers are derived dynamically from `eds` (`countOutgoingEdges(edges, node.id)`), removing redundant, potentially stale counters from node data.
-- **Editor-Only Scope**: Visual editor only. Does not mutate host auth files or configuration files directly.
+- **Explicit Save Changes & Management PATCH (VP-4)**:
+  - Supports authenticated persistence of dirty auth file prefixes via `PATCH /v0/management/auth-files/fields`.
+  - Stages changes locally with dirty tracking; strictly no auto-PATCH on keystroke.
+  - Reconciles saved state using submitted values without losing concurrent in-flight edits.
+  - Multi-file partial failure handling via `Promise.allSettled` with per-file sanitized errors (401/404/409) and selective retry.
+  - Local-only demo remains non-persistable; synthetic nodes are never sent to the Management API.
 - **Zero External CDN Dependencies**: All assets (HTML, CSS, JS, fonts) are bundled locally.
 
 ## Project Structure
