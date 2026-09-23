@@ -1,12 +1,15 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
+import { viteSingleFile } from 'vite-plugin-singlefile';
 
 export default defineConfig({
-  plugins: [react()],
-  base: './',
+  plugins: [react(), viteSingleFile()],
   build: {
     outDir: '../internal/web/assets',
     emptyOutDir: true,
+    modulePreload: {
+      polyfill: false,
+    },
   },
   test: {
     globals: true,

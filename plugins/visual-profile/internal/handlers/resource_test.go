@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -16,6 +17,9 @@ func TestResourceHandler_ServeIndex(t *testing.T) {
 		DefaultProfilesBasePath + "/",
 		DefaultProfilesBasePath + "/index.html",
 	}
+
+	scriptSrcRegex := regexp.MustCompile(`(?i)<script\b[^>]*\bsrc\s*=`)
+	stylesheetRegex := regexp.MustCompile(`(?i)<link\b[^>]*\b(rel\s*=\s*["']?stylesheet|href\s*=\s*["'][^"']*\.css)`)
 
 	for _, p := range paths {
 		req := httptest.NewRequest(http.MethodGet, p, nil)
@@ -34,6 +38,64 @@ func TestResourceHandler_ServeIndex(t *testing.T) {
 
 		if rec.Header().Get("X-Content-Type-Options") != "nosniff" {
 			t.Errorf("expected nosniff header for %q", p)
+		}
+
+		bodyStr := rec.Body.String()
+		if len(bodyStr) < 100000 {
+			t.Errorf("expected single-file index HTML >100KB for %q, got %d bytes", p, len(bodyStr))
+		}
+		if !strings.Contains(bodyStr, "<style") {
+			t.Errorf("expected inline <style> tag for %q", p)
+		}
+		if !strings.Contains(bodyStr, "<script") {
+			t.Errorf("expected inline <script> tag for %q", p)
+		}
+		if scriptSrcRegex.MatchString(bodyStr) {
+			t.Errorf("expected no script src for %q", p)
+		}
+		if stylesheetRegex.MatchString(bodyStr) {
+			t.Errorf("expected no stylesheet link for %q", p)
+		}
+		if strings.Contains(strings.ToLower(bodyStr), "modulepreload") {
+			t.Errorf("expected Vite modulePreload polyfill to be disabled for %q", p)
+		}
+		linkRegex := regexp.MustCompile(`(?i)<link\b[^>]*>`)
+		if linkRegex.MatchString(bodyStr) {
+			t.Errorf("expected zero <link> tags in single-file index HTML for %q, found: %s", p, linkRegex.FindString(bodyStr))
+		}
+	}
+}
+
+// TestResourceHandler_HostSlashlessVsInternalIsolation verifies:
+// - Host-facing runtime routing is strictly slashless "/profiles" (the only path supported by CLIProxyAPI host resourceRoutes).
+// - In isolation, ResourceHandler also defensively tolerates trailing slash variants.
+func TestResourceHandler_HostSlashlessVsInternalIsolation(t *testing.T) {
+	handler := NewResourceHandlerWithPath("/profiles")
+
+	paths := []string{
+		"/profiles",            // Host registered slashless route (only supported host runtime path)
+		"/profiles/",           // Internal isolation trailing slash fallback
+		"/profiles/index.html", // Internal isolation index.html fallback
+	}
+
+	for _, p := range paths {
+		req := httptest.NewRequest(http.MethodGet, p, nil)
+		rec := httptest.NewRecorder()
+
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected 200 OK for %q, got %d", p, rec.Code)
+		}
+
+		contentType := rec.Header().Get("Content-Type")
+		if !strings.Contains(contentType, "text/html") {
+			t.Errorf("expected text/html for %q, got %q", p, contentType)
+		}
+
+		bodyStr := rec.Body.String()
+		if !strings.Contains(bodyStr, `<div id="root">`) {
+			t.Errorf("expected root div for %q", p)
 		}
 	}
 }

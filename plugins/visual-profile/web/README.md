@@ -85,6 +85,20 @@ Interactive React Flow prefix topology editor for CLIProxyAPI parent/child accou
   - A **Retry** button is rendered on partial or complete failure. Clicking Retry triggers save for ONLY the remaining dirty files, as successful files have already advanced their `initialPrefix` and are no longer dirty.
   - **Pool Rotation Support**: Multiple accounts sharing a prefix pool (e.g. rotation accounts) are supported without client-side unique-prefix lockout.
 
+## Single-File Self-Contained Bundle (VP-6)
+
+- **Single-File Architecture**:
+  - `vite-plugin-singlefile` inlines all CSS (`<style>`) and JavaScript (`<script>`) directly into a single self-contained `index.html`.
+  - External browser subresource requests (`<script src="...">`, `<link rel="stylesheet" ...>`, `<link rel="icon" ...>`) are completely eliminated.
+  - Vite `modulePreload` polyfill is explicitly disabled (`modulePreload: { polyfill: false }`), removing dead `fetch()` calls for module scripts.
+  - Zero runtime CDN or remote resource dependencies; single HTML unchanged semantics authored by `gonzalez962`.
+- **Host Route Alignment (Slashless Runtime vs. Internal Isolation)**:
+  - The CLIProxyAPI host (`ServeResourceHTTP`) resolves resources via exact route table lookup (`resourceRoutes[GET full r.URL.Path]`), where only the slashless `/profiles` route is registered.
+  - **Host-Facing Runtime URL**: Only slashless `/profiles` is supported at runtime through CLIProxyAPI; runtime requests with a trailing slash (`/profiles/`) are not matched by the host router and return 404.
+  - **Internal Handler Isolation**: The internal plugin handler (`MatchProfilesRoute`) tolerates a trailing slash in isolation as a defensive fallback, but this is an internal test/handler detail and not a supported host runtime route.
+  - Subresource paths such as `/assets/...` or `/profiles/assets/...` are rejected before reaching plugin handlers.
+  - Delivering a fully self-contained `index.html` allows the entire visual topology editor to load and function properly under the exact slashless `/profiles` host route without secondary network fetches.
+
 ## Development & Verification Commands
 
 ```bash

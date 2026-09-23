@@ -4,8 +4,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io/fs"
-	"net/url"
 	"regexp"
 	"strings"
 	"testing"
@@ -93,22 +91,25 @@ func TestManagementResourceAndHandling(t *testing.T) {
 		t.Fatalf("failed to decode index HTML body: %v", err)
 	}
 	indexHTML := string(indexBodyBytes)
-	expectedBaseTag := `<base href="/v0/resource/plugins/visual-profile/profiles/">`
-	if !strings.Contains(indexHTML, expectedBaseTag) {
-		t.Errorf("expected index HTML to contain base tag %q", expectedBaseTag)
+	if !strings.Contains(indexHTML, `<div id="root">`) {
+		t.Errorf("expected index HTML to contain root div")
 	}
-	baseIdx := strings.Index(indexHTML, "<base ")
-	scriptIdx := strings.Index(indexHTML, "<script ")
-	linkIdx := strings.Index(indexHTML, "<link ")
-	if baseIdx == -1 || scriptIdx == -1 || linkIdx == -1 {
-		t.Errorf("expected <base>, <script>, and <link> tags in HTML")
-	} else {
-		if baseIdx > scriptIdx {
-			t.Errorf("expected <base> before <script>")
-		}
-		if baseIdx > linkIdx {
-			t.Errorf("expected <base> before <link>")
-		}
+	if !strings.Contains(indexHTML, "<style") {
+		t.Errorf("expected index HTML to contain inline <style>")
+	}
+	if !strings.Contains(indexHTML, "<script") {
+		t.Errorf("expected index HTML to contain inline <script>")
+	}
+	scriptSrcRegex := regexp.MustCompile(`(?i)<script\b[^>]*\bsrc\s*=`)
+	if scriptSrcRegex.MatchString(indexHTML) {
+		t.Errorf("expected single-file index HTML to have no script src, found match")
+	}
+	linkCSSRegex := regexp.MustCompile(`(?i)<link\b[^>]*\b(rel\s*=\s*["']?stylesheet|href\s*=\s*["'][^"']*\.css)`)
+	if linkCSSRegex.MatchString(indexHTML) {
+		t.Errorf("expected single-file index HTML to have no stylesheet link, found match")
+	}
+	if strings.Contains(indexHTML, "<base ") {
+		t.Errorf("expected no obsolete <base> tag in single-file index HTML")
 	}
 
 	// 3. management.handle rejects malformed JSON with 400 Bad Request
@@ -171,104 +172,67 @@ func TestManagementResourceAndHandling(t *testing.T) {
 		t.Errorf("expected status code 400 for directory traversal, got %d", respHostile.StatusCode)
 	}
 
-	// 7. Valid embedded JS file returns 200 with application/javascript
-	var jsRelPath string
-	_ = fs.WalkDir(web.AssetsFS, "assets", func(p string, d fs.DirEntry, walkErr error) error {
-		if walkErr == nil && !d.IsDir() && strings.HasSuffix(p, ".js") {
-			jsRelPath = strings.TrimPrefix(p, "assets/")
-			return fs.SkipAll
-		}
-		return nil
-	})
-	if jsRelPath != "" {
-		jsReqJSON := []byte(fmt.Sprintf(`{"Method":"GET","Path":"/v0/resource/plugins/visual-profile/profiles/%s"}`, jsRelPath))
-		rawJS, err := plugin.HandlePluginMethod("management.handle", jsReqJSON)
+	// 7. Host resource routing: Only slashless /profiles is registered and supported by host runtime routing.
+	// Internal handler also tolerates trailing slash defensively in isolation.
+	profilesRoutes := []string{
+		"/profiles",                                    // Host registered slashless route (only supported host runtime path)
+		"/profiles/",                                   // Internal isolation fallback
+		"/v0/resource/plugins/visual-profile/profiles",  // Internal isolation plugin path
+		"/v0/resource/plugins/visual-profile/profiles/", // Internal isolation plugin path with trailing slash
+	}
+	for _, p := range profilesRoutes {
+		routeReqJSON := []byte(fmt.Sprintf(`{"Method":"GET","Path":"%s"}`, p))
+		rawRoute, err := plugin.HandlePluginMethod("management.handle", routeReqJSON)
 		if err != nil {
-			t.Fatalf("failed to fetch embedded JS: %v", err)
+			t.Fatalf("failed to fetch HTML for %s: %v", p, err)
 		}
-		var envJS plugin.Envelope
-		_ = json.Unmarshal(rawJS, &envJS)
-		var respJS plugin.ManagementResponsePayload
-		_ = json.Unmarshal(envJS.Result, &respJS)
-		if respJS.StatusCode != 200 {
-			t.Errorf("expected status 200 for valid embedded JS, got %d", respJS.StatusCode)
+		var envRoute plugin.Envelope
+		_ = json.Unmarshal(rawRoute, &envRoute)
+		var respRoute plugin.ManagementResponsePayload
+		_ = json.Unmarshal(envRoute.Result, &respRoute)
+		if respRoute.StatusCode != 200 {
+			t.Errorf("expected status 200 for %s, got %d", p, respRoute.StatusCode)
 		}
-		if len(respJS.Headers["Content-Type"]) == 0 || !strings.Contains(respJS.Headers["Content-Type"][0], "javascript") {
-			t.Errorf("expected javascript content-type, got %v", respJS.Headers["Content-Type"])
+		rawBytes, _ := base64.StdEncoding.DecodeString(respRoute.Body)
+		if len(rawBytes) == 0 {
+			t.Errorf("expected non-empty body for %s", p)
 		}
 	}
 
-	// 8. Valid embedded CSS file returns 200 with text/css
-	var cssRelPath string
-	_ = fs.WalkDir(web.AssetsFS, "assets", func(p string, d fs.DirEntry, walkErr error) error {
-		if walkErr == nil && !d.IsDir() && strings.HasSuffix(p, ".css") {
-			cssRelPath = strings.TrimPrefix(p, "assets/")
-			return fs.SkipAll
-		}
-		return nil
-	})
-	if cssRelPath != "" {
-		cssReqJSON := []byte(fmt.Sprintf(`{"Method":"GET","Path":"/v0/resource/plugins/visual-profile/profiles/%s"}`, cssRelPath))
-		rawCSS, err := plugin.HandlePluginMethod("management.handle", cssReqJSON)
-		if err != nil {
-			t.Fatalf("failed to fetch embedded CSS: %v", err)
-		}
-		var envCSS plugin.Envelope
-		_ = json.Unmarshal(rawCSS, &envCSS)
-		var respCSS plugin.ManagementResponsePayload
-		_ = json.Unmarshal(envCSS.Result, &respCSS)
-		if respCSS.StatusCode != 200 {
-			t.Errorf("expected status 200 for valid embedded CSS, got %d", respCSS.StatusCode)
-		}
-		if len(respCSS.Headers["Content-Type"]) == 0 || !strings.Contains(respCSS.Headers["Content-Type"][0], "text/css") {
-			t.Errorf("expected text/css content-type, got %v", respCSS.Headers["Content-Type"])
-		}
-	}
-
-	// 9. URL resolution regression verification
-	// Verifies that relative asset paths resolve under /profiles/assets/ via injected base tag
-	// when requested without trailing slash.
-	reqWithoutSlash := []byte(`{"Method":"GET","Path":"/v0/resource/plugins/visual-profile/profiles"}`)
-	rawWithoutSlash, err := plugin.HandlePluginMethod("management.handle", reqWithoutSlash)
+	// 8. Single-file build verification: embed includes inline build with no subresource dependencies
+	assetData, mimeType, err := web.GetAsset("index.html")
 	if err != nil {
-		t.Fatalf("failed to fetch HTML without trailing slash: %v", err)
+		t.Fatalf("failed to get index.html from embedded web assets: %v", err)
 	}
-	var envWithoutSlash plugin.Envelope
-	_ = json.Unmarshal(rawWithoutSlash, &envWithoutSlash)
-	var respWithoutSlash plugin.ManagementResponsePayload
-	_ = json.Unmarshal(envWithoutSlash.Result, &respWithoutSlash)
-	rawHTMLBytes, _ := base64.StdEncoding.DecodeString(respWithoutSlash.Body)
-	rawHTML := string(rawHTMLBytes)
+	if !strings.Contains(mimeType, "text/html") {
+		t.Errorf("expected text/html for index.html, got %q", mimeType)
+	}
+	if len(assetData) < 100000 {
+		t.Errorf("expected inline bundle >100KB, got %d bytes", len(assetData))
+	}
+	assetHTML := string(assetData)
+	if !strings.Contains(assetHTML, "<style") || !strings.Contains(assetHTML, "<script") {
+		t.Errorf("expected inline style and script tags in embedded index.html")
+	}
+	if strings.Contains(strings.ToLower(assetHTML), "modulepreload") {
+		t.Errorf("expected Vite modulePreload polyfill to be disabled in embedded index.html")
+	}
+	linkRegex := regexp.MustCompile(`(?i)<link\b[^>]*>`)
+	if linkRegex.MatchString(assetHTML) {
+		t.Errorf("expected zero <link> tags in single-file embedded index.html, found: %s", linkRegex.FindString(assetHTML))
+	}
 
-	baseRegex := regexp.MustCompile(`<base\s+href="([^"]+)"`)
-	baseMatches := baseRegex.FindStringSubmatch(rawHTML)
-	if len(baseMatches) < 2 {
-		t.Fatalf("base tag missing in response HTML")
-	}
-	baseURL, err := url.Parse(baseMatches[1])
+	// 9. External subresource rejection: separate CSS/JS subpaths return 404
+	subresourceJSON := []byte(`{"Method":"GET","Path":"/v0/resource/plugins/visual-profile/profiles/assets/index.js"}`)
+	rawSub, err := plugin.HandlePluginMethod("management.handle", subresourceJSON)
 	if err != nil {
-		t.Fatalf("failed to parse base href: %v", err)
+		t.Fatalf("failed to call management.handle: %v", err)
 	}
-
-	linkRegex := regexp.MustCompile(`<link\b[^>]*\bhref="([^"]+)"`)
-	linkMatch := linkRegex.FindStringSubmatch(rawHTML)
-	if len(linkMatch) >= 2 {
-		relCSS, err := url.Parse(linkMatch[1])
-		if err != nil {
-			t.Fatalf("failed to parse CSS href: %v", err)
-		}
-		resolvedCSS := baseURL.ResolveReference(relCSS).Path
-		if !strings.HasPrefix(resolvedCSS, "/v0/resource/plugins/visual-profile/profiles/assets/") {
-			t.Errorf("resolved CSS path %q must be under /profiles/assets/", resolvedCSS)
-		}
-		cssJSON := []byte(fmt.Sprintf(`{"Method":"GET","Path":"%s"}`, resolvedCSS))
-		rawCSSRes, _ := plugin.HandlePluginMethod("management.handle", cssJSON)
-		var envCSSRes plugin.Envelope
-		_ = json.Unmarshal(rawCSSRes, &envCSSRes)
-		var respCSSRes plugin.ManagementResponsePayload
-		_ = json.Unmarshal(envCSSRes.Result, &respCSSRes)
-		if respCSSRes.StatusCode != 200 {
-			t.Errorf("expected status 200 for resolved CSS asset %q, got %d", resolvedCSS, respCSSRes.StatusCode)
-		}
+	var envSub plugin.Envelope
+	_ = json.Unmarshal(rawSub, &envSub)
+	var respSub plugin.ManagementResponsePayload
+	_ = json.Unmarshal(envSub.Result, &respSub)
+	if respSub.StatusCode != 404 {
+		t.Errorf("expected status 404 for separate asset subresource request, got %d", respSub.StatusCode)
 	}
 }
