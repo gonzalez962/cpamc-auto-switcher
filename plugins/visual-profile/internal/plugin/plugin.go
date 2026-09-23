@@ -1,12 +1,15 @@
 package plugin
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"html"
 	"net/http"
 	"net/url"
 	"path"
+	"regexp"
 	"strings"
 
 	"visual-profile/internal/handlers"
@@ -16,6 +19,11 @@ import (
 
 // ABIVersion defines the supported CLIProxyAPI C-ABI version.
 const ABIVersion uint32 = 1
+
+var (
+	baseTagRegex = regexp.MustCompile(`(?i)<base\b[^>]*>`)
+	headTagRegex = regexp.MustCompile(`(?i)<head(\s[^>]*)?>`)
+)
 
 // Envelope wraps all method responses in the standard CLIProxyAPI JSON protocol.
 type Envelope struct {
@@ -55,9 +63,9 @@ func HandlePluginMethod(method string, request []byte) ([]byte, error) {
 			"metadata": map[string]any{
 				"Name":             "visual-profile",
 				"Version":          version.Version,
-				"Author":           "el Gentleman",
+				"Author":           "gonzalez962",
 				"Description":      "Visual profile prefix management plugin with React Flow editor",
-				"GitHubRepository": "https://github.com/Clowraider/cpamc-auto-switcher",
+				"GitHubRepository": "https://github.com/gonzalez962/cpamc-auto-switcher",
 				"Logo":             "",
 				"ConfigFields":     []any{},
 			},
@@ -110,6 +118,11 @@ func MatchProfilesRoute(rawPath string) (subpath string, matched bool) {
 
 	// Normalize Windows backslashes
 	normalized := strings.ReplaceAll(unescaped, "\\", "/")
+
+	// Strip query string and fragment if present in raw path
+	if idx := strings.IndexAny(normalized, "?#"); idx != -1 {
+		normalized = normalized[:idx]
+	}
 
 	// Split by '/' to inspect exact path segments
 	segments := strings.Split(normalized, "/")
@@ -246,6 +259,13 @@ func HandleManagementHTTP(request []byte) ([]byte, error) {
 
 	headers := handlers.DefaultSecurityHeaders(contentType)
 
+	// Inject dynamic <base href=".../profiles/"> for HTML responses so relative assets
+	// (e.g. ./assets/...) resolve under /profiles/assets/ regardless of trailing slash in the menu URL.
+	if cleanSubpath == "index.html" || strings.HasPrefix(contentType, "text/html") {
+		baseHref := DeriveProfilesBasePath(req.Path)
+		assetBytes = InjectBaseTag(assetBytes, baseHref)
+	}
+
 	// For HEAD requests, response headers must match but body must be empty
 	var bodyEncoded string
 	if method != http.MethodHead {
@@ -263,6 +283,133 @@ func HandleManagementHTTP(request []byte) ([]byte, error) {
 		return nil, err
 	}
 	return OKEnvelope(raw), nil
+}
+
+// DeriveProfilesBasePath extracts and sanitizes the URL prefix up to and including '/profiles/'.
+// It ensures:
+// 1. Only safe absolute-path references starting with a single '/' are returned.
+// 2. No scheme, protocol-relative (//), or host/origin injection is allowed.
+// 3. No markup injection (e.g. quotes, brackets, control characters).
+// 4. Validates every path segment up to 'profiles'.
+// 5. Falls back to "/profiles/" if the path is invalid or cannot be safely parsed.
+func DeriveProfilesBasePath(rawPath string) string {
+	fallback := "/profiles/"
+	if rawPath == "" {
+		return fallback
+	}
+
+	unescaped := rawPath
+	if u, err := url.PathUnescape(rawPath); err == nil {
+		unescaped = u
+	}
+
+	// Normalize Windows backslashes
+	normalized := strings.ReplaceAll(unescaped, "\\", "/")
+
+	// Strip query string and fragment
+	if idx := strings.IndexAny(normalized, "?#"); idx != -1 {
+		normalized = normalized[:idx]
+	}
+
+	// Reject protocol-relative URLs, schemes, control chars, traversal, and HTML markup
+	if strings.HasPrefix(normalized, "//") ||
+		strings.Contains(normalized, "://") ||
+		strings.ContainsAny(normalized, "<>\"'`&\r\n\t\x00") ||
+		strings.Contains(normalized, "..") {
+		return fallback
+	}
+
+	// Split by '/' to inspect path segments
+	segments := strings.Split(normalized, "/")
+
+	profilesIdx := -1
+	for i, seg := range segments {
+		if seg == "profiles" {
+			profilesIdx = i
+			break
+		}
+	}
+
+	if profilesIdx == -1 {
+		return fallback
+	}
+
+	// Validate all segments up to 'profiles'
+	// Each segment must only contain valid path characters: [a-zA-Z0-9_\-\.~%]
+	prefixSegments := segments[:profilesIdx+1]
+	for i, seg := range prefixSegments {
+		if seg == "" {
+			// First segment can be empty if path started with '/'
+			if i == 0 {
+				continue
+			}
+			// Middle empty segments (e.g. //) are invalid
+			return fallback
+		}
+		for _, ch := range seg {
+			if !isSafePathChar(ch) {
+				return fallback
+			}
+		}
+	}
+
+	base := strings.Join(prefixSegments, "/")
+	if !strings.HasPrefix(base, "/") {
+		base = "/" + base
+	}
+	if !strings.HasSuffix(base, "/") {
+		base = base + "/"
+	}
+
+	cleanBase := path.Clean(base)
+	if !strings.HasSuffix(cleanBase, "/") {
+		cleanBase = cleanBase + "/"
+	}
+
+	// Must start with a single '/' and not '//'
+	if !strings.HasPrefix(cleanBase, "/") || strings.HasPrefix(cleanBase, "//") {
+		return fallback
+	}
+
+	return cleanBase
+}
+
+func isSafePathChar(ch rune) bool {
+	return (ch >= 'a' && ch <= 'z') ||
+		(ch >= 'A' && ch <= 'Z') ||
+		(ch >= '0' && ch <= '9') ||
+		ch == '-' || ch == '_' || ch == '.' || ch == '~' || ch == '%'
+}
+
+// InjectBaseTag injects or updates the <base href="..."> tag in HTML content.
+// It places the tag in the <head> block before any script or link elements.
+func InjectBaseTag(htmlContent []byte, baseHref string) []byte {
+	escapedHref := html.EscapeString(baseHref)
+	baseTag := `<base href="` + escapedHref + `">`
+
+	// 1. If an existing <base ...> tag is present, replace it
+	if baseTagRegex.Match(htmlContent) {
+		return baseTagRegex.ReplaceAll(htmlContent, []byte(baseTag))
+	}
+
+	// 2. Otherwise insert right after opening <head> or <head ...> tag
+	loc := headTagRegex.FindIndex(htmlContent)
+	if loc != nil {
+		headEnd := loc[1]
+		var buf bytes.Buffer
+		buf.Write(htmlContent[:headEnd])
+		buf.WriteString("\n    ")
+		buf.WriteString(baseTag)
+		buf.Write(htmlContent[headEnd:])
+		return buf.Bytes()
+	}
+
+	// 3. Fallback: prepend base tag if no <head> found
+	var buf bytes.Buffer
+	buf.WriteString(baseTag)
+	buf.WriteString("\n")
+	buf.Write(htmlContent)
+	return buf.Bytes()
 }
 
 // OKEnvelope creates a successful Envelope with raw JSON result.
