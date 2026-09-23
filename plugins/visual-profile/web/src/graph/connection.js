@@ -34,14 +34,64 @@ export function countOutgoingEdges(edges, sourceId) {
 }
 
 /**
- * Determines the next 1-based child sequence number for a given source node.
+ * Canonical edge identifier generator.
+ * Enforces unambiguous deterministic edge identity across graphs.
  *
- * @param {Array<Object>} edges - The current array of edges
- * @param {string} sourceId - The ID of the source (parent) node
- * @returns {number} The next sequence number (outgoingCount + 1)
+ * @param {string} source
+ * @param {string} target
+ * @returns {string} Deterministic edge ID `edge__${source}-${target}`
  */
-export function getNextChildNumber(edges, sourceId) {
-  return countOutgoingEdges(edges, sourceId) + 1;
+export function getEdgeId(source, target) {
+  return `edge__${source}-${target}`;
+}
+
+/**
+ * Determines the next 1-based child sequence number for a given source node.
+ * Avoids collisions with existing child prefixes across all nodes when edges are deleted
+ * or when custom child prefixes exist, while preserving count + 1 when available.
+ *
+ * Supports both signatures:
+ * - getNextChildNumber(edges, sourceId) [legacy fallback]
+ * - getNextChildNumber(nodes, edges, sourceId, parentPrefix) [collision-free]
+ *
+ * @param {Array<Object>} nodesOrEdges
+ * @param {Array<Object>|string} edgesOrSourceId
+ * @param {string} [sourceIdOrParentPrefix]
+ * @param {string} [parentPrefix]
+ * @returns {number} The next sequence number
+ */
+export function getNextChildNumber(
+  nodesOrEdges,
+  edgesOrSourceId,
+  sourceIdOrParentPrefix,
+  parentPrefix
+) {
+  if (Array.isArray(nodesOrEdges) && typeof edgesOrSourceId === 'string') {
+    // Legacy signature: (edges, sourceId)
+    return countOutgoingEdges(nodesOrEdges, edgesOrSourceId) + 1;
+  }
+
+  const nodes = nodesOrEdges;
+  const edges = edgesOrSourceId;
+  const sourceId = sourceIdOrParentPrefix;
+  const pfx = parentPrefix;
+
+  const baseCount = countOutgoingEdges(edges, sourceId) + 1;
+  if (!pfx || !Array.isArray(nodes)) {
+    return baseCount;
+  }
+
+  const existingPrefixes = new Set(
+    nodes
+      .map((n) => (n && n.data ? n.data.prefix : ''))
+      .filter(Boolean)
+  );
+
+  let candidate = baseCount;
+  while (existingPrefixes.has(`${pfx}_${candidate}`)) {
+    candidate++;
+  }
+  return candidate;
 }
 
 /**
@@ -135,6 +185,14 @@ export function validateConnection(nodes, edges, connection) {
     return { valid: false, reason: 'target_already_has_parent', sourceNode, targetNode };
   }
 
+  // Source node MUST have a non-empty prefix to establish child routes
+  // Prevents falling back to filename or assigning invalid child routes
+  const sourcePrefix =
+    sourceNode.data?.prefix !== undefined ? String(sourceNode.data.prefix).trim() : '';
+  if (!sourcePrefix) {
+    return { valid: false, reason: 'source_prefix_empty', sourceNode, targetNode };
+  }
+
   return { valid: true, sourceNode, targetNode };
 }
 
@@ -160,14 +218,18 @@ export function applyConnectionPure(nodes, edges, connection) {
   }
 
   const { sourceNode, targetNode } = validation;
-  const parentPrefix =
-    sourceNode.data?.prefix || sourceNode.data?.label || sourceNode.id;
-  const nextNumber = getNextChildNumber(edges, connection.source);
+  const parentPrefix = String(sourceNode.data.prefix).trim();
+  const nextNumber = getNextChildNumber(
+    nodes,
+    edges,
+    connection.source,
+    parentPrefix
+  );
   const childPrefix = calculateChildPrefix(parentPrefix, nextNumber);
 
   const newEdge = {
     ...connection,
-    id: connection.id || `xy-edge__${connection.source}-${connection.target}`,
+    id: connection.id || getEdgeId(connection.source, connection.target),
   };
 
   const updatedEdges = [...edges, newEdge];

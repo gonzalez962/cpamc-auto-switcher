@@ -3,6 +3,7 @@ import {
   calculateChildPrefix,
   countOutgoingEdges,
   getNextChildNumber,
+  getEdgeId,
   validateConnection,
   applyConnectionPure,
 } from './connection';
@@ -179,5 +180,25 @@ describe('applyConnectionPure', () => {
     expect(result.applied).toBe(true);
     expect(result.childPrefix).toBe('agy_p1_1');
     expect(frozenEdges.length).toBe(0);
+  });
+
+  it('generates deterministic edge ID via getEdgeId', () => {
+    expect(getEdgeId('parent-1', 'child-1')).toBe('edge__parent-1-child-1');
+  });
+
+  it('prevents collision on edge removal by allocating next unused child prefix across nodes', () => {
+    // Scenario: p1 is connected to c1 (agy_p1_1) and c2 (agy_p1_2)
+    const step1 = applyConnectionPure(initialNodes, [], { source: 'p1', target: 'c1' });
+    const step2 = applyConnectionPure(step1.nodes, step1.edges, { source: 'p1', target: 'c2' });
+
+    // Edge to c1 is deleted: now only edge to c2 remains (countOutgoingEdges is 1)
+    const edgesAfterRemoval = step2.edges.filter((e) => e.target !== 'c1');
+    expect(edgesAfterRemoval.length).toBe(1);
+
+    // Connecting c3 must NOT reuse agy_p1_2 (which c2 already holds) even though outgoing count is 1!
+    const step3 = applyConnectionPure(step2.nodes, edgesAfterRemoval, { source: 'p1', target: 'c3' });
+    expect(step3.applied).toBe(true);
+    expect(step3.childPrefix).toBe('agy_p1_3');
+    expect(step3.nodes.find((n) => n.id === 'c3').data.prefix).toBe('agy_p1_3');
   });
 });

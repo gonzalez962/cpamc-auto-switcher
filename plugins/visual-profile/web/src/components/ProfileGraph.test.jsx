@@ -175,4 +175,844 @@ describe('ProfileGraph Component and onConnect Integration', () => {
     expect(screen.getByText('prop_root_1')).toBeTruthy();
     expect(screen.queryByText('unlinked_1')).toBeNull();
   });
+
+  it('updates prefix and dirty stats atomically when inline editing in ProfileGraph', () => {
+    const realNodes = [
+      {
+        id: 'acc1.json',
+        type: 'profile',
+        position: { x: 50, y: 50 },
+        data: {
+          prefix: 'agy_p1',
+          initialPrefix: 'agy_p1',
+          label: 'agy_p1',
+          fileName: 'acc1.json',
+          isRoot: true,
+          isDirty: false,
+        },
+      },
+    ];
+
+    render(<ProfileGraph initialNodes={realNodes} initialEdges={[]} />);
+
+    expect(screen.getByText('agy_p1')).toBeTruthy();
+    expect(screen.queryByTestId('stats-dirty-count')).toBeNull();
+
+    // Start inline editing
+    const editBtn = screen.getByTestId('btn-edit-prefix-acc1.json');
+    fireEvent.click(editBtn);
+
+    const input = screen.getByTestId('input-prefix-acc1.json');
+    fireEvent.change(input, { target: { value: 'custom_edited_pool' } });
+    fireEvent.click(screen.getByTestId('btn-save-prefix-acc1.json'));
+
+    // Label and prefix updated in DOM
+    expect(screen.getByText('custom_edited_pool')).toBeTruthy();
+    expect(screen.getByTestId('badge-dirty-acc1.json')).toBeTruthy();
+    expect(screen.getByTestId('stats-dirty-count')).toBeTruthy();
+    expect(screen.getByTestId('stats-dirty-count').textContent).toContain('1');
+  });
+
+  it('updates child dirty state and stats counter when connecting real nodes', () => {
+    const graphRef = React.createRef();
+    const realNodes = [
+      {
+        id: 'root.json',
+        type: 'profile',
+        position: { x: 50, y: 50 },
+        data: {
+          prefix: 'agy_p1',
+          initialPrefix: 'agy_p1',
+          label: 'agy_p1',
+          isRoot: true,
+          isDirty: false,
+        },
+      },
+      {
+        id: 'child.json',
+        type: 'profile',
+        position: { x: 50, y: 250 },
+        data: {
+          prefix: '',
+          initialPrefix: '',
+          label: 'child.json',
+          isRoot: false,
+          isDirty: false,
+        },
+      },
+    ];
+
+    render(<ProfileGraph ref={graphRef} initialNodes={realNodes} initialEdges={[]} />);
+
+    act(() => {
+      graphRef.current.connect({ source: 'root.json', target: 'child.json' });
+    });
+
+    expect(screen.getByText('agy_p1_1')).toBeTruthy();
+    expect(screen.getByTestId('badge-dirty-child.json')).toBeTruthy();
+    expect(screen.getByTestId('stats-dirty-count')).toBeTruthy();
+  });
+
+  it('hides synthetic creation buttons when allowSynthetic is false (production mode)', () => {
+    render(<ProfileGraph initialNodes={initialNodes} allowSynthetic={false} />);
+
+    expect(screen.getByTestId('badge-live-auth')).toBeTruthy();
+    expect(screen.queryByTestId('btn-add-root')).toBeNull();
+    expect(screen.queryByTestId('btn-add-child')).toBeNull();
+    expect(screen.queryByTestId('input-custom-prefix')).toBeNull();
+    // Reset graph button remains
+    expect(screen.getByTestId('btn-reset-graph')).toBeTruthy();
+  });
+
+  it('prompts confirmation when resetting graph with dirty edits and aborts if user cancels', () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+
+    const realNodes = [
+      {
+        id: 'acc1.json',
+        type: 'profile',
+        position: { x: 50, y: 50 },
+        data: {
+          prefix: 'agy_p1',
+          initialPrefix: 'agy_p1',
+          label: 'agy_p1',
+          fileName: 'acc1.json',
+          isRoot: true,
+          isDirty: false,
+        },
+      },
+    ];
+
+    const graphRef = React.createRef();
+    render(<ProfileGraph ref={graphRef} initialNodes={realNodes} initialEdges={[]} />);
+
+    // Make node dirty via edit
+    fireEvent.click(screen.getByTestId('btn-edit-prefix-acc1.json'));
+    const input = screen.getByTestId('input-prefix-acc1.json');
+    fireEvent.change(input, { target: { value: 'dirty_prefix' } });
+    fireEvent.click(screen.getByTestId('btn-save-prefix-acc1.json'));
+
+    expect(screen.getByText('dirty_prefix')).toBeTruthy();
+    expect(graphRef.current.isDirty()).toBe(true);
+
+    // Click Reset: confirm is called and returns false
+    fireEvent.click(screen.getByTestId('btn-reset-graph'));
+    expect(confirmSpy).toHaveBeenCalled();
+
+    // Node is STILL dirty and modification is preserved
+    expect(screen.getByText('dirty_prefix')).toBeTruthy();
+    expect(graphRef.current.isDirty()).toBe(true);
+
+    // Now confirm reset
+    confirmSpy.mockReturnValue(true);
+    fireEvent.click(screen.getByTestId('btn-reset-graph'));
+
+    // Node is reset back to initial prefix
+    expect(screen.getByText('agy_p1')).toBeTruthy();
+    expect(graphRef.current.isDirty()).toBe(false);
+  });
+
+  describe('VP-4 Explicit Save Changes, PATCH, Reconciliation, and Partial Failure', () => {
+    it('keeps local-only demo mode strictly non-persistable', async () => {
+      const graphRef = React.createRef();
+      render(<ProfileGraph ref={graphRef} initialNodes={initialNodes} allowSynthetic={true} />);
+
+      // Save button must NOT be rendered in demo mode
+      expect(screen.queryByTestId('btn-save-changes')).toBeNull();
+
+      // Programmatic save attempt must reject
+      let result;
+      await act(async () => {
+        result = await graphRef.current.save();
+      });
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Demo mode is local-only and non-persistable');
+    });
+
+    it('enables Save button only when real dirty nodes exist in live mode', () => {
+      const realNodes = [
+        {
+          id: 'acc1.json',
+          type: 'profile',
+          position: { x: 50, y: 50 },
+          data: {
+            prefix: 'agy_p1',
+            initialPrefix: 'agy_p1',
+            label: 'agy_p1',
+            fileName: 'acc1.json',
+            isRoot: true,
+            isDirty: false,
+            isSynthetic: false,
+          },
+        },
+      ];
+
+      render(<ProfileGraph initialNodes={realNodes} initialEdges={[]} allowSynthetic={false} />);
+
+      const saveBtn = screen.getByTestId('btn-save-changes');
+      expect(saveBtn).toBeTruthy();
+      expect(saveBtn.disabled).toBe(true);
+
+      // Edit node prefix to make it dirty
+      fireEvent.click(screen.getByTestId('btn-edit-prefix-acc1.json'));
+      fireEvent.change(screen.getByTestId('input-prefix-acc1.json'), {
+        target: { value: 'agy_edited' },
+      });
+      fireEvent.click(screen.getByTestId('btn-save-prefix-acc1.json'));
+
+      // Save button should now be enabled and show dirty count
+      expect(saveBtn.disabled).toBe(false);
+      expect(saveBtn.textContent).toContain('Save Changes (1)');
+    });
+
+    it('sends PATCH with exact physical filename and prefix, including empty string', async () => {
+      const capturedRequests = [];
+      const mockFetch = vi.fn().mockImplementation((url, opts) => {
+        capturedRequests.push({ url, opts, body: JSON.parse(opts.body) });
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ status: 'ok' }),
+        });
+      });
+
+      const realNodes = [
+        {
+          id: 'acc1.json',
+          type: 'profile',
+          position: { x: 50, y: 50 },
+          data: {
+            prefix: 'agy_p1',
+            initialPrefix: 'agy_p1',
+            label: 'agy_p1',
+            fileName: 'acc1.json',
+            isRoot: true,
+            isDirty: false,
+            isSynthetic: false,
+          },
+        },
+      ];
+
+      render(
+        <ProfileGraph
+          initialNodes={realNodes}
+          initialEdges={[]}
+          allowSynthetic={false}
+          apiOptions={{ key: 'mgmt-key-1', fetchFn: mockFetch }}
+        />
+      );
+
+      // Edit to empty string prefix
+      fireEvent.click(screen.getByTestId('btn-edit-prefix-acc1.json'));
+      fireEvent.change(screen.getByTestId('input-prefix-acc1.json'), {
+        target: { value: '' },
+      });
+      fireEvent.click(screen.getByTestId('btn-save-prefix-acc1.json'));
+
+      // Save changes
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('btn-save-changes'));
+      });
+
+      expect(capturedRequests.length).toBe(1);
+      expect(capturedRequests[0].url).toBe('/v0/management/auth-files/fields');
+      expect(capturedRequests[0].opts.method).toBe('PATCH');
+      expect(capturedRequests[0].opts.headers['Authorization']).toBe('Bearer mgmt-key-1');
+      expect(capturedRequests[0].body).toEqual({
+        name: 'acc1.json',
+        prefix: '',
+      });
+
+      // Feedback banner confirms success
+      expect(screen.getByTestId('save-status-success')).toBeTruthy();
+      expect(screen.getByText('Successfully saved 1 profile(s).')).toBeTruthy();
+    });
+
+    it('never sends synthetic nodes to the Management API', async () => {
+      const capturedNames = [];
+      const mockFetch = vi.fn().mockImplementation((url, opts) => {
+        const body = JSON.parse(opts.body);
+        capturedNames.push(body.name);
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ status: 'ok' }),
+        });
+      });
+
+      const mixedNodes = [
+        {
+          id: 'real-auth.json',
+          type: 'profile',
+          position: { x: 50, y: 50 },
+          data: {
+            prefix: 'p_real_dirty',
+            initialPrefix: 'p_real_init',
+            label: 'real-auth.json',
+            fileName: 'real-auth.json',
+            isRoot: true,
+            isDirty: true,
+            isSynthetic: false,
+          },
+        },
+        {
+          id: 'synthetic-node',
+          type: 'profile',
+          position: { x: 50, y: 250 },
+          data: {
+            prefix: 'p_synthetic_dirty',
+            initialPrefix: 'p_synthetic_init',
+            label: 'synthetic-node',
+            fileName: 'synthetic-node',
+            isRoot: false,
+            isDirty: true,
+            isSynthetic: true, // Marked synthetic
+          },
+        },
+      ];
+
+      render(
+        <ProfileGraph
+          initialNodes={mixedNodes}
+          initialEdges={[]}
+          allowSynthetic={false}
+          apiOptions={{ key: 'test-key', fetchFn: mockFetch }}
+        />
+      );
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('btn-save-changes'));
+      });
+
+      expect(capturedNames).toEqual(['real-auth.json']);
+      expect(capturedNames.includes('synthetic-node')).toBe(false);
+    });
+
+    it('prevents overlapping saves while a request is in flight', async () => {
+      let resolveFetch;
+      const pendingPromise = new Promise((resolve) => {
+        resolveFetch = resolve;
+      });
+
+      const mockFetch = vi.fn().mockReturnValue(
+        pendingPromise.then(() => ({
+          ok: true,
+          status: 200,
+          json: async () => ({ status: 'ok' }),
+        }))
+      );
+
+      const realNodes = [
+        {
+          id: 'acc1.json',
+          type: 'profile',
+          position: { x: 50, y: 50 },
+          data: {
+            prefix: 'p1_dirty',
+            initialPrefix: 'p1_init',
+            label: 'p1_dirty',
+            fileName: 'acc1.json',
+            isRoot: true,
+            isDirty: true,
+            isSynthetic: false,
+          },
+        },
+      ];
+
+      const graphRef = React.createRef();
+      render(
+        <ProfileGraph
+          ref={graphRef}
+          initialNodes={realNodes}
+          initialEdges={[]}
+          allowSynthetic={false}
+          apiOptions={{ key: 'test-key', fetchFn: mockFetch }}
+        />
+      );
+
+      // Trigger first save
+      act(() => {
+        fireEvent.click(screen.getByTestId('btn-save-changes'));
+      });
+
+      expect(graphRef.current.isSaving()).toBe(true);
+      expect(screen.getByText('Saving...')).toBeTruthy();
+
+      // Trigger second overlapping save while first is pending
+      const overlapResult = await graphRef.current.save();
+      expect(overlapResult.success).toBe(false);
+      expect(overlapResult.error).toBe('Save already in progress');
+
+      // mockFetch must have been called exactly ONCE
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+
+      // Finish first request
+      await act(async () => {
+        resolveFetch();
+      });
+
+      expect(graphRef.current.isSaving()).toBe(false);
+      expect(screen.getByTestId('save-status-success')).toBeTruthy();
+    });
+
+    it('CRITICAL: does not lose edits made while request is pending and preserves latest draft', async () => {
+      let resolveFetch;
+      const pendingPromise = new Promise((resolve) => {
+        resolveFetch = resolve;
+      });
+
+      const mockFetch = vi.fn().mockReturnValue(
+        pendingPromise.then(() => ({
+          ok: true,
+          status: 200,
+          json: async () => ({ status: 'ok' }),
+        }))
+      );
+
+      const realNodes = [
+        {
+          id: 'acc1.json',
+          type: 'profile',
+          position: { x: 50, y: 50 },
+          data: {
+            prefix: 'submitted_prefix',
+            initialPrefix: 'original_prefix',
+            label: 'submitted_prefix',
+            fileName: 'acc1.json',
+            isRoot: true,
+            isDirty: true,
+            isSynthetic: false,
+          },
+        },
+      ];
+
+      const graphRef = React.createRef();
+      render(
+        <ProfileGraph
+          ref={graphRef}
+          initialNodes={realNodes}
+          initialEdges={[]}
+          allowSynthetic={false}
+          apiOptions={{ key: 'test-key', fetchFn: mockFetch }}
+        />
+      );
+
+      // 1. Click Save Changes: request for 'submitted_prefix' is sent and is in flight
+      act(() => {
+        fireEvent.click(screen.getByTestId('btn-save-changes'));
+      });
+      expect(graphRef.current.isSaving()).toBe(true);
+
+      // 2. While request is pending, user makes another draft modification
+      act(() => {
+        graphRef.current.updateNodePrefix('acc1.json', 'concurrent_draft_prefix');
+      });
+
+      // Verify draft prefix is immediately in DOM
+      expect(screen.getByText('concurrent_draft_prefix')).toBeTruthy();
+
+      // 3. Network response arrives successfully for 'submitted_prefix'
+      await act(async () => {
+        resolveFetch();
+      });
+
+      expect(graphRef.current.isSaving()).toBe(false);
+
+      // 4. Verification:
+      // Draft prefix 'concurrent_draft_prefix' MUST NOT be overwritten or lost!
+      expect(screen.getByText('concurrent_draft_prefix')).toBeTruthy();
+      // Node MUST remain dirty because concurrent draft differs from the newly saved initialPrefix
+      expect(graphRef.current.isDirty()).toBe(true);
+      const node = graphRef.current.getNodes().find((n) => n.id === 'acc1.json');
+      expect(node.data.prefix).toBe('concurrent_draft_prefix');
+      expect(node.data.initialPrefix).toBe('submitted_prefix');
+      expect(node.data.isDirty).toBe(true);
+    });
+
+    it('handles multi-file partial failure without claiming atomicity and allows retry', async () => {
+      const mockFetch = vi.fn().mockImplementation((url, opts) => {
+        const body = JSON.parse(opts.body);
+        if (body.name === 'good.json') {
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: async () => ({ status: 'ok' }),
+          });
+        }
+        if (body.name === 'conflict.json') {
+          return Promise.resolve({
+            ok: false,
+            status: 409,
+            json: async () => ({ error: 'Conflict: duplicate prefix' }),
+          });
+        }
+        return Promise.reject(new Error('Unknown'));
+      });
+
+      const realNodes = [
+        {
+          id: 'good.json',
+          type: 'profile',
+          position: { x: 50, y: 50 },
+          data: {
+            prefix: 'good_new',
+            initialPrefix: 'good_old',
+            label: 'good_new',
+            fileName: 'good.json',
+            isRoot: true,
+            isDirty: true,
+            isSynthetic: false,
+          },
+        },
+        {
+          id: 'conflict.json',
+          type: 'profile',
+          position: { x: 50, y: 250 },
+          data: {
+            prefix: 'conflict_new',
+            initialPrefix: 'conflict_old',
+            label: 'conflict_new',
+            fileName: 'conflict.json',
+            isRoot: false,
+            isDirty: true,
+            isSynthetic: false,
+          },
+        },
+      ];
+
+      const graphRef = React.createRef();
+      render(
+        <ProfileGraph
+          ref={graphRef}
+          initialNodes={realNodes}
+          initialEdges={[]}
+          allowSynthetic={false}
+          apiOptions={{ key: 'test-key', fetchFn: mockFetch }}
+        />
+      );
+
+      // Trigger Save Changes
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('btn-save-changes'));
+      });
+
+      // Partial failure banner is shown
+      expect(screen.getByTestId('save-status-partial')).toBeTruthy();
+      expect(screen.getByText(/Partially saved: 1 succeeded, 1 failed/)).toBeTruthy();
+      expect(screen.getByTestId('save-failure-conflict.json')).toBeTruthy();
+      expect(screen.getByTestId('save-failure-conflict.json').textContent).toContain(
+        '409 Conflict'
+      );
+
+      // Check node state reconciliation:
+      const nodes = graphRef.current.getNodes();
+      const goodNode = nodes.find((n) => n.id === 'good.json');
+      const conflictNode = nodes.find((n) => n.id === 'conflict.json');
+
+      // good.json advanced initialPrefix and cleared dirty
+      expect(goodNode.data.initialPrefix).toBe('good_new');
+      expect(goodNode.data.isDirty).toBe(false);
+
+      // conflict.json retained original initialPrefix and remained dirty
+      expect(conflictNode.data.initialPrefix).toBe('conflict_old');
+      expect(conflictNode.data.isDirty).toBe(true);
+
+      // Retry button is available
+      const retryBtn = screen.getByTestId('btn-retry-save');
+      expect(retryBtn).toBeTruthy();
+
+      // Clear mock calls and configure conflict.json to succeed on retry
+      mockFetch.mockClear();
+      mockFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ status: 'ok' }),
+      });
+
+      // Click Retry
+      await act(async () => {
+        fireEvent.click(retryBtn);
+      });
+
+      // On retry, ONLY conflict.json is retried (good.json is already saved and clean)
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const retryBody = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(retryBody.name).toBe('conflict.json');
+
+      // Now all files succeeded
+      expect(screen.getByTestId('save-status-success')).toBeTruthy();
+      expect(graphRef.current.isDirty()).toBe(false);
+    });
+
+    it('sanitizes 401 Unauthorized and 404 Not Found errors without leaking secrets', async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 401,
+        json: async () => ({ error: 'unauthorized' }),
+      });
+
+      const realNodes = [
+        {
+          id: 'acc1.json',
+          type: 'profile',
+          position: { x: 50, y: 50 },
+          data: {
+            prefix: 'p1_dirty',
+            initialPrefix: 'p1_init',
+            label: 'p1_dirty',
+            fileName: 'acc1.json',
+            isRoot: true,
+            isDirty: true,
+            isSynthetic: false,
+          },
+        },
+      ];
+
+      render(
+        <ProfileGraph
+          initialNodes={realNodes}
+          initialEdges={[]}
+          allowSynthetic={false}
+          apiOptions={{ key: 'super-sensitive-token-xyz', fetchFn: mockFetch }}
+        />
+      );
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('btn-save-changes'));
+      });
+
+      expect(screen.getByTestId('save-status-error')).toBeTruthy();
+      expect(screen.getByText(/401 Unauthorized/)).toBeTruthy();
+      // Crucial: token is not leaked into DOM
+      expect(screen.queryByText(/super-sensitive-token-xyz/)).toBeNull();
+    });
+
+    it('permits saving duplicate prefixes for accounts sharing a rotation pool', async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true }),
+      });
+
+      const poolNodes = [
+        {
+          id: 'acc1.json',
+          type: 'profile',
+          position: { x: 50, y: 50 },
+          data: {
+            prefix: 'duplicate_pool',
+            initialPrefix: 'p1_init',
+            label: 'duplicate_pool',
+            fileName: 'acc1.json',
+            isRoot: true,
+            isDirty: true,
+            isSynthetic: false,
+          },
+        },
+        {
+          id: 'acc2.json',
+          type: 'profile',
+          position: { x: 50, y: 250 },
+          data: {
+            prefix: 'duplicate_pool',
+            initialPrefix: 'p2_init',
+            label: 'duplicate_pool',
+            fileName: 'acc2.json',
+            isRoot: true,
+            isDirty: true,
+            isSynthetic: false,
+          },
+        },
+      ];
+
+      render(
+        <ProfileGraph
+          initialNodes={poolNodes}
+          initialEdges={[]}
+          allowSynthetic={false}
+          apiOptions={{ key: 'test-key', fetchFn: mockFetch }}
+        />
+      );
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('btn-save-changes'));
+      });
+
+      // Saving duplicate prefixes in pool rotation must be permitted
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(screen.getByTestId('save-status-success')).toBeTruthy();
+    });
+
+    it('saved graph reset restores saved baseline rather than stale initial props', async () => {
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true }),
+      });
+
+      const initialNodes = [
+        {
+          id: 'acc1.json',
+          type: 'profile',
+          position: { x: 50, y: 50 },
+          data: {
+            prefix: 'initial_val',
+            initialPrefix: 'initial_val',
+            label: 'initial_val',
+            fileName: 'acc1.json',
+            isRoot: true,
+            isDirty: false,
+            isSynthetic: false,
+          },
+        },
+      ];
+
+      const graphRef = React.createRef();
+      render(
+        <ProfileGraph
+          ref={graphRef}
+          initialNodes={initialNodes}
+          initialEdges={[]}
+          allowSynthetic={false}
+          apiOptions={{ key: 'test-key', fetchFn: mockFetch }}
+        />
+      );
+
+      // 1. Edit prefix to saved_val and save
+      fireEvent.click(screen.getByTestId('btn-edit-prefix-acc1.json'));
+      fireEvent.change(screen.getByTestId('input-prefix-acc1.json'), {
+        target: { value: 'saved_val' },
+      });
+      fireEvent.click(screen.getByTestId('btn-save-prefix-acc1.json'));
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('btn-save-changes'));
+      });
+      expect(screen.getByTestId('save-status-success')).toBeTruthy();
+      expect(graphRef.current.isDirty()).toBe(false);
+
+      // 2. Make another dirty edit to dirty_val
+      fireEvent.click(screen.getByTestId('btn-edit-prefix-acc1.json'));
+      fireEvent.change(screen.getByTestId('input-prefix-acc1.json'), {
+        target: { value: 'dirty_val' },
+      });
+      fireEvent.click(screen.getByTestId('btn-save-prefix-acc1.json'));
+      expect(screen.getByText('dirty_val')).toBeTruthy();
+      expect(graphRef.current.isDirty()).toBe(true);
+
+      // 3. Reset graph: must restore saved_val (the saved baseline), NOT initial_val (stale prop)
+      fireEvent.click(screen.getByTestId('btn-reset-graph'));
+
+      expect(screen.getByText('saved_val')).toBeTruthy();
+      expect(screen.queryByText('initial_val')).toBeNull();
+      expect(graphRef.current.isDirty()).toBe(false);
+    });
+
+    it('prevents Reset Graph while a save is in progress', async () => {
+      let resolveSave;
+      const savePromise = new Promise((resolve) => {
+        resolveSave = resolve;
+      });
+      const mockFetch = vi.fn().mockReturnValue(
+        savePromise.then(() => ({
+          ok: true,
+          status: 200,
+          json: async () => ({ ok: true }),
+        }))
+      );
+
+      const realNodes = [
+        {
+          id: 'acc1.json',
+          type: 'profile',
+          position: { x: 50, y: 50 },
+          data: {
+            prefix: 'agy_p1',
+            initialPrefix: 'agy_p1',
+            label: 'agy_p1',
+            fileName: 'acc1.json',
+            isRoot: true,
+            isDirty: false,
+            isSynthetic: false,
+          },
+        },
+      ];
+
+      const graphRef = React.createRef();
+      render(
+        <ProfileGraph
+          ref={graphRef}
+          initialNodes={realNodes}
+          initialEdges={[]}
+          allowSynthetic={false}
+          apiOptions={{ key: 'test-key', fetchFn: mockFetch }}
+        />
+      );
+
+      // Edit to make dirty
+      fireEvent.click(screen.getByTestId('btn-edit-prefix-acc1.json'));
+      fireEvent.change(screen.getByTestId('input-prefix-acc1.json'), {
+        target: { value: 'in_flight' },
+      });
+      fireEvent.click(screen.getByTestId('btn-save-prefix-acc1.json'));
+
+      // Start save
+      act(() => {
+        fireEvent.click(screen.getByTestId('btn-save-changes'));
+      });
+
+      // While saving, Reset button must be disabled and ref.reset() must return false
+      expect(screen.getByTestId('btn-reset-graph').disabled).toBe(true);
+      expect(graphRef.current.isSaving()).toBe(true);
+      expect(graphRef.current.reset()).toBe(false);
+
+      // Complete save
+      await act(async () => {
+        resolveSave();
+      });
+
+      expect(screen.getByTestId('btn-reset-graph').disabled).toBe(false);
+      expect(graphRef.current.isSaving()).toBe(false);
+    });
+
+    it('does not send PATCH on keystroke (no auto-PATCH on keystroke)', () => {
+      const mockFetch = vi.fn();
+
+      const realNodes = [
+        {
+          id: 'acc1.json',
+          type: 'profile',
+          position: { x: 50, y: 50 },
+          data: {
+            prefix: 'agy_p1',
+            initialPrefix: 'agy_p1',
+            label: 'agy_p1',
+            fileName: 'acc1.json',
+            isRoot: true,
+            isDirty: false,
+            isSynthetic: false,
+          },
+        },
+      ];
+
+      render(
+        <ProfileGraph
+          initialNodes={realNodes}
+          initialEdges={[]}
+          allowSynthetic={false}
+          apiOptions={{ key: 'test-key', fetchFn: mockFetch }}
+        />
+      );
+
+      // Open edit mode and type
+      fireEvent.click(screen.getByTestId('btn-edit-prefix-acc1.json'));
+      const input = screen.getByTestId('input-prefix-acc1.json');
+      fireEvent.change(input, { target: { value: 'keystroke_1' } });
+      fireEvent.change(input, { target: { value: 'keystroke_2' } });
+
+      // No network calls on keystrokes
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
 });

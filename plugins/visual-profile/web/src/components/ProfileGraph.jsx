@@ -1,5 +1,6 @@
 import React, {
   useState,
+  useEffect,
   useCallback,
   useMemo,
   useReducer,
@@ -21,6 +22,7 @@ import '@xyflow/react/dist/style.css';
 import ProfileNode from './ProfileNode';
 import { countOutgoingEdges } from '../graph/connection';
 import { graphReducer } from '../graph/graphReducer';
+import { saveAuthFilePrefixes } from '../api/managementClient';
 
 const nodeTypes = {
   profile: ProfileNode,
@@ -93,6 +95,10 @@ const ProfileGraph = forwardRef(function ProfileGraph(
     initialEdges = initialEdgesData,
     onGraphChange,
     onConnect: externalOnConnect,
+    allowSynthetic = true,
+    apiOptions = {},
+    onSaveSuccess,
+    onSaveError,
   },
   ref
 ) {
@@ -109,6 +115,33 @@ const ProfileGraph = forwardRef(function ProfileGraph(
   });
 
   const { nodes, edges } = graphState;
+
+  // Save changes state and overlap guard
+  const [isSaving, setIsSaving] = useState(false);
+  const isSavingRef = useRef(false);
+
+  // Maintain clean baseline to prevent Reset from reverting to stale initial props after save
+  const currentBaselineRef = useRef({
+    nodes: safeInitialNodes,
+    edges: safeInitialEdges,
+  });
+
+  useEffect(() => {
+    currentBaselineRef.current = {
+      nodes: safeInitialNodes,
+      edges: safeInitialEdges,
+    };
+  }, [safeInitialNodes, safeInitialEdges]);
+  const [saveState, setSaveState] = useState({
+    status: 'idle', // 'idle' | 'saving' | 'success' | 'partial' | 'error'
+    message: '',
+    successful: [],
+    failed: [],
+  });
+
+  const handleDismissSaveStatus = useCallback(() => {
+    setSaveState({ status: 'idle', message: '', successful: [], failed: [] });
+  }, []);
 
   // Monotonic ID counter for event handler ID generation (keeps reducer 100% pure)
   const idCounterRef = useRef(1);
@@ -159,17 +192,290 @@ const ProfileGraph = forwardRef(function ProfileGraph(
     [externalOnConnect, onGraphChange]
   );
 
+  // Atomic inline prefix change callback with validation feedback
+  const handleNodePrefixChange = useCallback(
+    (nodeId, newPrefix) => {
+      const targetNode = nodes.find((n) => n.id === nodeId);
+      const trimmed = typeof newPrefix === 'string' ? newPrefix.trim() : '';
+
+      // Check parent with attached children
+      const hasChildren = edges.some((e) => e && e.source === nodeId);
+      if (hasChildren && trimmed !== (targetNode?.data?.prefix || '')) {
+        return {
+          success: false,
+          error:
+            'Cannot rename parent with attached children. Disconnect children first.',
+        };
+      }
+
+      dispatch({
+        type: 'UPDATE_NODE_PREFIX',
+        id: nodeId,
+        prefix: newPrefix,
+      });
+
+      if (typeof onGraphChange === 'function') {
+        onGraphChange();
+      }
+
+      return { success: true };
+    },
+    [nodes, edges, onGraphChange]
+  );
+
+  /**
+   * Saves dirty real auth-file prefixes to the Management API via PATCH.
+   *
+   * SAFETY & RECONCILIATION INVARIANTS:
+   * - Restricts concurrently conflicting duplicate non-empty prefixes before dispatching.
+   * - Prevents overlapping saves: multiple clicks or invocations while in-flight are ignored.
+   * - Demo mode is strictly local-only and non-persistable.
+   * - Synthetic nodes are NEVER sent to the Management API.
+   * - Sends exact physical filename and current prefix (including empty string).
+   * - CRITICAL: Reconciles saved prefixes per filename using submitted values via RECONCILE_SAVED_NODES
+   *   pure reducer dispatch, advancing initialPrefix for successful files, retaining original
+   *   initialPrefix for failed files, and preserving all concurrent draft edits made while pending.
+   * - Does NOT blindly reset the graph.
+   * - Multi-file partial failure: no claiming atomicity; reports partial success and permits retry.
+   */
+  const handleSaveChanges = useCallback(async () => {
+    // Guard against demo mode: demo is local-only non-persistable
+    if (allowSynthetic) {
+      const err = 'Demo mode is local-only and non-persistable.';
+      setSaveState({
+        status: 'error',
+        message: err,
+        successful: [],
+        failed: [],
+      });
+      return { success: false, error: err };
+    }
+
+    // Prevent overlapping saves
+    if (isSavingRef.current) {
+      return { success: false, error: 'Save already in progress' };
+    }
+
+    // Find dirty REAL auth file nodes (never send synthetic nodes)
+    const dirtyRealNodes = nodes.filter(
+      (n) => Boolean(n.data?.isDirty) && !n.data?.isSynthetic
+    );
+
+    if (dirtyRealNodes.length === 0) {
+      setSaveState({
+        status: 'idle',
+        message: 'No unsaved modifications to persist.',
+        successful: [],
+        failed: [],
+      });
+      return { success: true, count: 0 };
+    }
+
+    // Extract exact physical filename and current prefix (including empty string)
+    const filesToSave = dirtyRealNodes.map((n) => {
+      const fileName = n.data?.fileName || n.id;
+      const prefix = n.data?.prefix !== undefined ? String(n.data.prefix).trim() : '';
+      return {
+        id: n.id,
+        name: fileName,
+        prefix,
+        isSynthetic: Boolean(n.data?.isSynthetic),
+      };
+    });
+
+    isSavingRef.current = true;
+    setIsSaving(true);
+    setSaveState({
+      status: 'saving',
+      message: `Saving ${filesToSave.length} modified profile(s)...`,
+      successful: [],
+      failed: [],
+    });
+
+    try {
+      const saveResult = await saveAuthFilePrefixes(filesToSave, apiOptions);
+      const { successful = [], failed = [] } = saveResult;
+
+      // CRITICAL: Reconcile saved prefixes using submitted values, preserving latest drafts
+      dispatch({
+        type: 'RECONCILE_SAVED_NODES',
+        successful,
+        failed,
+      });
+
+      if (typeof onGraphChange === 'function') {
+        onGraphChange();
+      }
+
+      // Update baseline nodes with newly saved prefixes to prevent Reset from reverting to stale initial props
+      if (successful.length > 0) {
+        const savedMap = new Map();
+        successful.forEach((item) => {
+          if (item && item.name) {
+            savedMap.set(item.name, item.prefix || '');
+          }
+        });
+
+        currentBaselineRef.current = {
+          nodes: currentBaselineRef.current.nodes.map((node) => {
+            const fileKey = node.data?.fileName || node.id;
+            if (savedMap.has(fileKey)) {
+              const newPrefix = savedMap.get(fileKey);
+              return {
+                ...node,
+                data: {
+                  ...node.data,
+                  prefix: newPrefix,
+                  initialPrefix: newPrefix,
+                  label: newPrefix || node.data?.fileName || node.id,
+                  isDirty: false,
+                },
+              };
+            }
+            return node;
+          }),
+          edges: [...edges],
+        };
+      }
+
+      if (failed.length === 0) {
+        setSaveState({
+          status: 'success',
+          message: `Successfully saved ${successful.length} profile(s).`,
+          successful,
+          failed: [],
+        });
+        if (typeof onSaveSuccess === 'function') {
+          onSaveSuccess(successful);
+        }
+        return { success: true, count: successful.length, successful };
+      } else if (successful.length > 0) {
+        setSaveState({
+          status: 'partial',
+          message: `Partially saved: ${successful.length} succeeded, ${failed.length} failed.`,
+          successful,
+          failed,
+        });
+        if (typeof onSaveError === 'function') {
+          onSaveError({ successful, failed });
+        }
+        return { success: false, partial: true, successful, failed };
+      } else {
+        setSaveState({
+          status: 'error',
+          message: `Failed to save ${failed.length} profile(s).`,
+          successful: [],
+          failed,
+        });
+        if (typeof onSaveError === 'function') {
+          onSaveError({ successful: [], failed });
+        }
+        return { success: false, failed };
+      }
+    } catch (err) {
+      const errMsg = err.message || 'Failed to save profiles';
+      setSaveState({
+        status: 'error',
+        message: errMsg,
+        successful: [],
+        failed: filesToSave.map((f) => ({ ...f, error: errMsg })),
+      });
+      if (typeof onSaveError === 'function') {
+        onSaveError({
+          successful: [],
+          failed: filesToSave.map((f) => ({ ...f, error: errMsg })),
+        });
+      }
+      return { success: false, error: errMsg };
+    } finally {
+      isSavingRef.current = false;
+      setIsSaving(false);
+    }
+  }, [
+    allowSynthetic,
+    nodes,
+    apiOptions,
+    onGraphChange,
+    onSaveSuccess,
+    onSaveError,
+  ]);
+
+  /**
+   * Resets graph restoring baseline clean state.
+   * Prevents reset during save, and restores saved baseline rather than stale initial props.
+   * Prompts for confirmation if any node has unsaved modifications (dirty).
+   */
+  const handleResetGraph = useCallback(() => {
+    if (isSavingRef.current) {
+      return false; // Prevent reset during active save
+    }
+
+    const hasDirty = nodes.some((n) => Boolean(n.data?.isDirty));
+    if (hasDirty) {
+      const confirmed =
+        typeof window !== 'undefined' && typeof window.confirm === 'function'
+          ? window.confirm(
+              'You have unsaved prefix modifications. Resetting will discard all changes. Continue?'
+            )
+          : true;
+      if (!confirmed) {
+        return false;
+      }
+    }
+
+    const baseline = currentBaselineRef.current || {
+      nodes: safeInitialNodes,
+      edges: safeInitialEdges,
+    };
+    dispatch({ type: 'RESET', nodes: baseline.nodes, edges: baseline.edges });
+    return true;
+  }, [nodes, safeInitialNodes, safeInitialEdges]);
+
   // Expose imperative handle for direct programmatic testing
   useImperativeHandle(
     ref,
     () => ({
       connect: (conn) => onConnect(conn),
       onConnect,
+      updateNodePrefix: (id, prefix) => handleNodePrefixChange(id, prefix),
       getNodes: () => nodes,
       getEdges: () => edges,
-      reset: () => handleResetGraph(),
+      isDirty: () => nodes.some((n) => Boolean(n.data?.isDirty)),
+      isSaving: () => Boolean(isSavingRef.current),
+      save: () => handleSaveChanges(),
+      getSaveState: () => saveState,
+      reset: (force = false) => {
+        if (isSavingRef.current) {
+          return false; // Prevent reset during active save
+        }
+        if (!force && nodes.some((n) => Boolean(n.data?.isDirty))) {
+          const confirmed =
+            typeof window !== 'undefined' && typeof window.confirm === 'function'
+              ? window.confirm(
+                  'You have unsaved prefix modifications. Resetting will discard all changes. Continue?'
+                )
+              : true;
+          if (!confirmed) return false;
+        }
+        const baseline = currentBaselineRef.current || {
+          nodes: safeInitialNodes,
+          edges: safeInitialEdges,
+        };
+        dispatch({ type: 'RESET', nodes: baseline.nodes, edges: baseline.edges });
+        return true;
+      },
     }),
-    [onConnect, nodes, edges]
+    [
+      onConnect,
+      handleNodePrefixChange,
+      handleSaveChanges,
+      isSaving,
+      saveState,
+      nodes,
+      edges,
+      safeInitialNodes,
+      safeInitialEdges,
+    ]
   );
 
   // Input state for custom prefix
@@ -201,33 +507,28 @@ const ProfileGraph = forwardRef(function ProfileGraph(
     });
   }, [generateId]);
 
-  /**
-   * Resets graph restoring initial props (safeInitialNodes, safeInitialEdges).
-   */
-  const handleResetGraph = useCallback(() => {
-    dispatch({ type: 'RESET', nodes: safeInitialNodes, edges: safeInitialEdges });
-  }, [safeInitialNodes, safeInitialEdges]);
-
-  // Derive outgoingCount for nodes directly from current eds (no stale redundant counts)
+  // Derive outgoingCount and attach atomic onPrefixChange to all nodes
   const displayNodes = useMemo(() => {
     return nodes.map((node) => {
       const derivedCount = countOutgoingEdges(edges, node.id);
-      if (node.data?.outgoingCount === derivedCount) {
-        return node;
-      }
       return {
         ...node,
         data: {
           ...node.data,
           outgoingCount: derivedCount,
+          onPrefixChange: handleNodePrefixChange,
         },
       };
     });
-  }, [nodes, edges]);
+  }, [nodes, edges, handleNodePrefixChange]);
 
   // Derived metrics for UI status bar
   const rootCount = useMemo(() => nodes.filter((n) => n.data?.isRoot).length, [nodes]);
   const childCount = useMemo(() => nodes.filter((n) => !n.data?.isRoot).length, [nodes]);
+  const dirtyCount = useMemo(
+    () => nodes.filter((n) => Boolean(n.data?.isDirty)).length,
+    [nodes]
+  );
 
   return (
     <div className="graph-container">
@@ -235,46 +536,78 @@ const ProfileGraph = forwardRef(function ProfileGraph(
       <div className="graph-toolbar">
         <div className="toolbar-left">
           <span className="toolbar-title">Visual Profile Prefix Topology</span>
-          <span className="badge-editor-only">Editor Only — Local Graph</span>
+          {allowSynthetic ? (
+            <span className="badge-editor-only">Editor Only — Local Graph</span>
+          ) : (
+            <span className="badge-live-auth" data-testid="badge-live-auth">
+              Management Auth-Files
+            </span>
+          )}
         </div>
 
         <div className="toolbar-controls">
-          <div className="input-group">
-            <input
-              type="text"
-              placeholder="e.g. agy_p1 or custom_pool"
-              value={customPrefix}
-              onChange={(e) => setCustomPrefix(e.target.value)}
-              className="prefix-input"
-              data-testid="input-custom-prefix"
-            />
-            <button
-              type="button"
-              onClick={handleAddRootNode}
-              className="btn btn-primary"
-              data-testid="btn-add-root"
-            >
-              + Add Root Profile
-            </button>
-          </div>
+          {allowSynthetic && (
+            <>
+              <div className="input-group">
+                <input
+                  type="text"
+                  placeholder="e.g. agy_p1 or custom_pool"
+                  value={customPrefix}
+                  onChange={(e) => setCustomPrefix(e.target.value)}
+                  className="prefix-input"
+                  data-testid="input-custom-prefix"
+                />
+                <button
+                  type="button"
+                  onClick={handleAddRootNode}
+                  className="btn btn-primary"
+                  data-testid="btn-add-root"
+                >
+                  + Add Root Profile
+                </button>
+              </div>
 
-          <button
-            type="button"
-            onClick={handleAddChildNode}
-            className="btn btn-secondary"
-            data-testid="btn-add-child"
-          >
-            + Add Child Node
-          </button>
+              <button
+                type="button"
+                onClick={handleAddChildNode}
+                className="btn btn-secondary"
+                data-testid="btn-add-child"
+              >
+                + Add Child Node
+              </button>
+            </>
+          )}
 
           <button
             type="button"
             onClick={handleResetGraph}
             className="btn btn-outline"
             data-testid="btn-reset-graph"
+            disabled={isSaving}
           >
             Reset Graph
           </button>
+
+          {!allowSynthetic && (
+            <button
+              type="button"
+              onClick={handleSaveChanges}
+              disabled={isSaving || dirtyCount === 0}
+              className="btn btn-primary btn-save"
+              data-testid="btn-save-changes"
+              title={
+                dirtyCount === 0
+                  ? 'No unsaved modifications'
+                  : 'Save modified prefixes to Management API'
+              }
+            >
+              {isSaving
+                ? 'Saving...'
+                : dirtyCount > 0
+                ? `Save Changes (${dirtyCount})`
+                : 'Save Changes'}
+            </button>
+          )}
         </div>
       </div>
 
@@ -291,11 +624,64 @@ const ProfileGraph = forwardRef(function ProfileGraph(
         <span>
           Connections: <strong>{edges.length}</strong>
         </span>
+        {dirtyCount > 0 && (
+          <>
+            <span className="stats-divider">•</span>
+            <span className="stats-dirty" data-testid="stats-dirty-count">
+              Modified: <strong className="text-warning">{dirtyCount}</strong>
+            </span>
+          </>
+        )}
         <span className="stats-divider">•</span>
         <span className="stats-hint">
           Connect a parent node to a child node to assign <code>{'{parentPrefix}_{index}'}</code>
         </span>
       </div>
+
+      {/* Save Feedback Banner */}
+      {saveState.status !== 'idle' && (
+        <div
+          className={`save-status-banner save-status-${saveState.status}`}
+          data-testid={`save-status-${saveState.status}`}
+        >
+          <div className="save-status-content">
+            {saveState.status === 'saving' && <span className="loading-spinner-sm" />}
+            <span className="save-status-message">{saveState.message}</span>
+            {saveState.failed && saveState.failed.length > 0 && (
+              <ul className="save-status-failures">
+                {saveState.failed.map((f, i) => (
+                  <li key={i} data-testid={`save-failure-${f.name}`}>
+                    <code>{f.name}</code>: {f.error}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+          <div className="save-status-actions">
+            {(saveState.status === 'partial' || saveState.status === 'error') && (
+              <button
+                type="button"
+                className="btn btn-retry-save"
+                onClick={handleSaveChanges}
+                data-testid="btn-retry-save"
+              >
+                🔄 Retry
+              </button>
+            )}
+            {saveState.status !== 'saving' && (
+              <button
+                type="button"
+                className="btn-dismiss-banner"
+                onClick={handleDismissSaveStatus}
+                data-testid="btn-dismiss-save-status"
+                aria-label="Dismiss banner"
+              >
+                ✕
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* React Flow Canvas */}
       <div className="react-flow-wrapper" data-testid="rf-wrapper">
