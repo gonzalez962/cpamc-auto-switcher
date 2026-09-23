@@ -1,5 +1,6 @@
 import React, { memo, useState, useEffect, useCallback } from 'react';
 import { Handle, Position } from '@xyflow/react';
+import { maskDisplayIdentifier } from '../graph/connection';
 
 /**
  * Validates prefix format:
@@ -38,12 +39,17 @@ export function validateNodePrefix(val) {
  * - Handles incoming (target) and outgoing (source) connection points.
  */
 function ProfileNode({ id, data, isConnectable }) {
-  const currentPrefix = data?.prefix !== undefined ? data.prefix : data?.label || id;
+  const testIdKey = maskDisplayIdentifier(id);
+  const currentPrefix =
+    data?.prefix !== undefined ? data.prefix : maskDisplayIdentifier(data?.label || id);
   const isRoot = Boolean(data?.isRoot);
   const isDirty = Boolean(data?.isDirty);
   const outgoingCount = data?.outgoingCount ?? 0;
+  const hasParent = Boolean(data?.hasParent);
   const fileName = data?.fileName;
   const ambiguousParent = data?.ambiguousParent;
+  const accountType = data?.accountType || data?.type || data?.provider || '';
+  const maskedEmail = data?.maskedEmail || '';
 
   const [isEditing, setIsEditing] = useState(false);
   const [editValue, setEditValue] = useState(currentPrefix || '');
@@ -57,7 +63,7 @@ function ProfileNode({ id, data, isConnectable }) {
 
   const handleStartEdit = useCallback(() => {
     setEditValue(currentPrefix || '');
-    if (isRoot && outgoingCount > 0) {
+    if (outgoingCount > 0) {
       setError(
         'Cannot rename parent with attached children. Disconnect children first.'
       );
@@ -65,7 +71,25 @@ function ProfileNode({ id, data, isConnectable }) {
       setError('');
     }
     setIsEditing(true);
-  }, [currentPrefix, isRoot, outgoingCount]);
+  }, [currentPrefix, outgoingCount]);
+
+  const handleDisconnect = useCallback(() => {
+    if (outgoingCount > 0) {
+      setError(
+        'Cannot disconnect profile with attached descendants. Disconnect descendants first.'
+      );
+      return;
+    }
+
+    if (typeof data?.onDisconnect === 'function') {
+      const res = data.onDisconnect(id);
+      if (res && res.error) {
+        setError(res.error);
+        return;
+      }
+    }
+    setError('');
+  }, [id, outgoingCount, data]);
 
   const handleSave = useCallback(() => {
     const result = validateNodePrefix(editValue);
@@ -74,7 +98,7 @@ function ProfileNode({ id, data, isConnectable }) {
       return;
     }
 
-    if (isRoot && outgoingCount > 0 && result.value !== currentPrefix) {
+    if (outgoingCount > 0 && result.value !== currentPrefix) {
       setError(
         'Cannot rename parent with attached children. Disconnect children first.'
       );
@@ -91,7 +115,7 @@ function ProfileNode({ id, data, isConnectable }) {
 
     setError('');
     setIsEditing(false);
-  }, [editValue, id, data, isRoot, outgoingCount, currentPrefix]);
+  }, [editValue, id, data, outgoingCount, currentPrefix]);
 
   const handleCancel = useCallback(() => {
     setEditValue(currentPrefix || '');
@@ -104,7 +128,7 @@ function ProfileNode({ id, data, isConnectable }) {
       className={`profile-node ${isRoot ? 'profile-node-root' : 'profile-node-child'} ${
         isDirty ? 'profile-node-dirty' : ''
       }`}
-      data-testid={`profile-node-${id}`}
+      data-testid={`profile-node-${testIdKey}`}
     >
       {/* Target handle at the top for incoming connections (children) */}
       <Handle
@@ -120,27 +144,46 @@ function ProfileNode({ id, data, isConnectable }) {
           <span className={`profile-badge ${isRoot ? 'badge-root' : 'badge-child'}`}>
             {isRoot ? 'ROOT' : 'CHILD'}
           </span>
+          {accountType && (
+            <span
+              className={`profile-badge badge-account-type badge-type-${accountType.toLowerCase()}`}
+              data-testid={`badge-type-${testIdKey}`}
+            >
+              {accountType.toUpperCase()}
+            </span>
+          )}
           {isDirty && (
-            <span className="profile-badge badge-dirty" data-testid={`badge-dirty-${id}`}>
+            <span className="profile-badge badge-dirty" data-testid={`badge-dirty-${testIdKey}`}>
               DIRTY
             </span>
           )}
           {ambiguousParent && (
             <span
               className="profile-badge badge-ambiguous"
-              title={`Ambiguous parent: multiple accounts (${ambiguousParent.candidateNames.join(
-                ', '
-              )}) share prefix "${ambiguousParent.parentPrefix}". Parent relation left disconnected.`}
-              data-testid={`badge-ambiguous-${id}`}
+              title={`Ambiguous parent: multiple accounts (${(ambiguousParent.candidateNames || [])
+                .map(maskDisplayIdentifier)
+                .join(', ')}) share prefix "${ambiguousParent.parentPrefix}". Parent relation left disconnected.`}
+              data-testid={`badge-ambiguous-${testIdKey}`}
             >
               AMBIGUOUS PARENT
             </span>
           )}
         </div>
-        <span className="profile-node-id" title={fileName || id}>
-          #{fileName || id}
+        <span className="profile-node-id" title={maskDisplayIdentifier(fileName || id)}>
+          #{maskDisplayIdentifier(fileName || id)}
         </span>
       </div>
+
+      {/* Masked Email Subheader */}
+      {maskedEmail && (
+        <div
+          className="profile-node-email"
+          data-testid={`profile-node-email-${testIdKey}`}
+          title={maskedEmail}
+        >
+          {maskedEmail}
+        </div>
+      )}
 
       {/* Node Body with Inline Editing */}
       <div className="profile-node-body">
@@ -165,7 +208,7 @@ function ProfileNode({ id, data, isConnectable }) {
               }}
               autoFocus
               placeholder="Empty or prefix"
-              data-testid={`input-prefix-${id}`}
+              data-testid={`input-prefix-${testIdKey}`}
             />
             <div className="profile-node-edit-actions nodrag nopan">
               <button
@@ -173,7 +216,7 @@ function ProfileNode({ id, data, isConnectable }) {
                 className="btn-node-action btn-save-prefix nodrag nopan"
                 onClick={handleSave}
                 title="Save prefix (Enter)"
-                data-testid={`btn-save-prefix-${id}`}
+                data-testid={`btn-save-prefix-${testIdKey}`}
               >
                 ✓
               </button>
@@ -182,7 +225,7 @@ function ProfileNode({ id, data, isConnectable }) {
                 className="btn-node-action btn-cancel-prefix nodrag nopan"
                 onClick={handleCancel}
                 title="Cancel (Esc)"
-                data-testid={`btn-cancel-prefix-${id}`}
+                data-testid={`btn-cancel-prefix-${testIdKey}`}
               >
                 ✕
               </button>
@@ -190,37 +233,65 @@ function ProfileNode({ id, data, isConnectable }) {
             {error && (
               <div
                 className="profile-node-error nodrag nopan"
-                data-testid={`validation-error-${id}`}
+                data-testid={`validation-error-${testIdKey}`}
               >
-                {error}
+                {maskDisplayIdentifier(error)}
               </div>
             )}
           </div>
         ) : (
-          <div className="profile-node-display">
-            <div
-              className="profile-node-prefix"
-              title={currentPrefix || '(empty prefix)'}
-              onClick={handleStartEdit}
-              data-testid={`profile-node-prefix-${id}`}
-            >
-              {currentPrefix || <span className="prefix-empty-placeholder">&lt;empty&gt;</span>}
+          <>
+            <div className="profile-node-display">
+              <div
+                className="profile-node-prefix"
+                title={currentPrefix || '(empty prefix)'}
+                onClick={handleStartEdit}
+                data-testid={`profile-node-prefix-${testIdKey}`}
+              >
+                {currentPrefix || <span className="prefix-empty-placeholder">&lt;empty&gt;</span>}
+              </div>
+              <div className="profile-node-actions nodrag nopan">
+                <button
+                  type="button"
+                  className="btn-edit-prefix nodrag nopan"
+                  onClick={handleStartEdit}
+                  title={
+                    outgoingCount > 0
+                      ? 'Cannot rename parent with attached children'
+                      : 'Edit prefix'
+                  }
+                  data-testid={`btn-edit-prefix-${testIdKey}`}
+                  aria-label="Edit prefix"
+                >
+                  ✏️
+                </button>
+                {hasParent && (
+                  <button
+                    type="button"
+                    className="btn-disconnect-node nodrag nopan"
+                    onClick={handleDisconnect}
+                    title={
+                      outgoingCount > 0
+                        ? 'Cannot disconnect profile with attached descendants. Disconnect descendants first.'
+                        : 'Disconnect from parent'
+                    }
+                    data-testid={`btn-disconnect-${testIdKey}`}
+                    aria-label="Disconnect from parent"
+                  >
+                    Disconnect
+                  </button>
+                )}
+              </div>
             </div>
-            <button
-              type="button"
-              className="btn-edit-prefix nodrag nopan"
-              onClick={handleStartEdit}
-              title={
-                isRoot && outgoingCount > 0
-                  ? 'Cannot rename parent with attached children'
-                  : 'Edit prefix'
-              }
-              data-testid={`btn-edit-prefix-${id}`}
-              aria-label="Edit prefix"
-            >
-              ✏️
-            </button>
-          </div>
+            {error && (
+              <div
+                className="profile-node-error nodrag nopan"
+                data-testid={`validation-error-${testIdKey}`}
+              >
+                {maskDisplayIdentifier(error)}
+              </div>
+            )}
+          </>
         )}
       </div>
 
@@ -237,11 +308,13 @@ function ProfileNode({ id, data, isConnectable }) {
       {ambiguousParent && (
         <div
           className="profile-node-footer profile-node-ambiguous-footer"
-          data-testid={`ambiguity-notice-${id}`}
+          data-testid={`ambiguity-notice-${testIdKey}`}
         >
           <span
             className="profile-node-subtext text-warning"
-            title={`Candidates: ${ambiguousParent.candidateNames.join(', ')}`}
+            title={`Candidates: ${(ambiguousParent.candidateNames || [])
+              .map(maskDisplayIdentifier)
+              .join(', ')}`}
           >
             Multiple accounts share &ldquo;{ambiguousParent.parentPrefix}&rdquo; (disconnected)
           </span>

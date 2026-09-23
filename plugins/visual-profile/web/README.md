@@ -99,6 +99,38 @@ Interactive React Flow prefix topology editor for CLIProxyAPI parent/child accou
   - Subresource paths such as `/assets/...` or `/profiles/assets/...` are rejected before reaching plugin handlers.
   - Delivering a fully self-contained `index.html` allows the entire visual topology editor to load and function properly under the exact slashless `/profiles` host route without secondary network fetches.
 
+## Edge Removal, Descendant Guards & Display Metadata (VP-7)
+
+- **Parent-Child Edge Removal & Child Disconnect**:
+  - Supports edge deletion via React Flow canvas interactions (Backspace / Delete keys) and a visible **Disconnect** button rendered on linked child nodes (`btn-disconnect-<id>`).
+  - Disconnecting atomically removes the incoming parent-child edge, clears the child target's `prefix` to empty (`""`), resets its `label` to its filename or ID, and calculates `isDirty` against `initialPrefix` (`"" !== initialPrefix`).
+  - Unlinked child nodes and root nodes without incoming edges do not render the Disconnect button.
+- **Target Descendant Guard**:
+  - Disconnecting a child node that has attached outgoing edges (intermediate node with descendants) is strictly blocked in both the reducer and UI to prevent orphaned subtrees and inconsistent naming hierarchies.
+  - Inline editing and renaming are also strictly blocked on any node with attached descendants (`outgoingCount > 0`), irrespective of whether the node is a `ROOT` or an intermediate `CHILD`, maintaining strict prefix naming coherence across descendant subtrees.
+  - Visual feedback is rendered immediately on the node (`validation-error-<id>`) and on the graph feedback banner: *"Cannot disconnect profile with attached descendants. Disconnect descendants first."* or *"Cannot rename parent with attached children. Disconnect children first."*
+  - Original state (edges, prefixes, labels, dirty flags) is 100% preserved for rejected removals.
+- **Batch Removal Consistency & Stale Closure Elimination**:
+  - Authoritative edge partitioning is owned directly by the pure reducer (`removeEdgesAtomic` on `state.edges`), eliminating stale closure dependencies in `ProfileGraph` (`onEdgesChange`, `handleDisconnectNode`, and imperative `removeEdges`).
+  - React Flow `onEdgesChange` remove batches (e.g. multi-edge deletion) and rapid sequential disconnections iteratively evaluate dependencies on the pure state snapshot, preventing false rejections.
+  - Stale graph feedback banners are automatically cleared upon any subsequent successful action (connect, safe disconnect, prefix edit, or reset).
+- **Reconnecting & Dirty State Reset**:
+  - Reconnecting a disconnected child back to its original parent derives the child prefix and resets `isDirty` to `false` when it matches `initialPrefix`. Reconnecting to another parent updates the prefix and sets `isDirty: true`.
+  - Disconnecting a node originally loaded with empty prefix (`initialPrefix: ""`) resets `isDirty` to `false`.
+  - Staged empty prefixes persist to the server ONLY on explicit user **Save Changes** (`PATCH /v0/management/auth-files/fields` with `{ name, prefix: "" }`), never via auto-save.
+  - **Async Save Baseline & Prefix/Edge Coherence**:
+    - Reconciles saved prefixes while preserving active draft edits in the active graph (`isDirty: true`, draft disconnections, and in-flight edge additions).
+    - During baseline construction, if a node was successfully saved to the server with a non-empty child prefix (e.g. `agy_p1_1`) but was draft-disconnected while the async save was in-flight, its pre-save incoming parent edge is deterministically restored in the baseline.
+    - This eliminates baseline incoherence upon **Reset Graph**, guaranteeing that any reset restores both the server-saved child prefix AND its corresponding parent edge, preventing orphan child nodes with child prefixes.
+- **Safe Display Metadata, Privacy & Email Masking (`maskDisplayIdentifier`)**:
+  - `GET /v0/management/auth-files` metadata (`name`, `type`, `provider`, `email`) is propagated through listing, loading, and graph construction.
+  - Account type badge (`ANTIGRAVITY`, `CODEX`, etc.) is displayed on nodes using `type` with fallback to `provider`.
+  - Emails are masked following the `cmd/cpamc-auto-switcher/main.go` convention: first 3 + `...` + last 3 of the local part preserving the domain (e.g. `ant...unt@domain.org`); local parts with 6 or fewer characters remain unchanged.
+  - Shared display helper `maskDisplayIdentifier` abbreviates embedded emails across rendered node header IDs (`#fileName`), accessible title tooltips, ambiguous candidate name lists in badges/footers, error feedback banners, and all application-level `data-testid` attributes (e.g. `profile-node-dev...ser@openai.com.json`) while preserving non-email context and file extensions (e.g. `dev...ser@openai.com.json`).
+  - Display-only masking preserves immutable exact physical filenames and node IDs strictly in internal component state and Management API PATCH payloads. Non-email identifiers remain unchanged across all `data-testid` attributes.
+  - *Library constraint note*: React Flow internally attaches a `data-id="<nodeId>"` attribute to its outer canvas wrapper div elements outside component control; while this library-managed DOM attribute cannot be modified without breaking React Flow's internal reconciliation, all application-generated DOM elements, attributes (`data-testid`, `title`, labels, error text), and tooltips are strictly masked.
+  - Raw downloaded credential secrets, tokens, private keys, and unmasked emails are never stored, logged, or exposed in accessible DOM tooltips (`title`), error banners, or `data-testid` attributes; only the masked email is stored in `node.data`.
+
 ## Development & Verification Commands
 
 ```bash

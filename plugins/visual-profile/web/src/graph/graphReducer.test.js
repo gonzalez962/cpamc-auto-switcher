@@ -648,4 +648,399 @@ describe('graphReducer and connectNodesAtomic', () => {
       expect(node.data.isDirty).toBe(false);
     });
   });
+
+  describe('VP-7 Edge Removal, Disconnect & Descendant Guard Semantics', () => {
+    it('DISCONNECT_NODE atomically removes incoming edge and sets prefix to empty, label to fileName, and marks isDirty', () => {
+      const state = createInitialGraphState(
+        [
+          {
+            id: 'p1.json',
+            data: { fileName: 'p1.json', prefix: 'agy_p1', initialPrefix: 'agy_p1', isRoot: true },
+          },
+          {
+            id: 'c1.json',
+            data: {
+              fileName: 'c1.json',
+              prefix: 'agy_p1_1',
+              initialPrefix: 'agy_p1_1',
+              label: 'agy_p1_1',
+              isRoot: false,
+              isDirty: false,
+            },
+          },
+        ],
+        [{ id: 'e1', source: 'p1.json', target: 'c1.json' }]
+      );
+
+      const next = graphReducer(state, { type: 'DISCONNECT_NODE', nodeId: 'c1.json' });
+
+      // Edge is atomically removed
+      expect(next.edges).toHaveLength(0);
+
+      // Child target node is reset: empty prefix, label to fileName, isDirty true, isRoot false
+      const child = next.nodes.find((n) => n.id === 'c1.json');
+      expect(child.data.prefix).toBe('');
+      expect(child.data.label).toBe('c1.json');
+      expect(child.data.isDirty).toBe(true); // '' !== 'agy_p1_1'
+      expect(child.data.isRoot).toBe(false);
+    });
+
+    it('DISCONNECT_NODE resets isDirty to false when initialPrefix was empty', () => {
+      const state = createInitialGraphState(
+        [
+          {
+            id: 'p1.json',
+            data: { fileName: 'p1.json', prefix: 'agy_p1', initialPrefix: 'agy_p1', isRoot: true },
+          },
+          {
+            id: 'c1.json',
+            data: {
+              fileName: 'c1.json',
+              prefix: 'agy_p1_1',
+              initialPrefix: '', // Loaded originally with empty prefix
+              label: 'agy_p1_1',
+              isRoot: false,
+              isDirty: true,
+            },
+          },
+        ],
+        [{ id: 'e1', source: 'p1.json', target: 'c1.json' }]
+      );
+
+      const next = graphReducer(state, { type: 'DISCONNECT_NODE', nodeId: 'c1.json' });
+
+      expect(next.edges).toHaveLength(0);
+      const child = next.nodes.find((n) => n.id === 'c1.json');
+      expect(child.data.prefix).toBe('');
+      expect(child.data.isDirty).toBe(false); // '' === initialPrefix ''
+    });
+
+    it('DISCONNECT_NODE preserves original state when target has attached descendants', () => {
+      const state = createInitialGraphState(
+        [
+          {
+            id: 'p1.json',
+            data: { fileName: 'p1.json', prefix: 'agy_p1', initialPrefix: 'agy_p1', isRoot: true },
+          },
+          {
+            id: 'c1.json',
+            data: {
+              fileName: 'c1.json',
+              prefix: 'agy_p1_1',
+              initialPrefix: 'agy_p1_1',
+              label: 'agy_p1_1',
+              isRoot: false,
+            },
+          },
+          {
+            id: 'c2.json',
+            data: {
+              fileName: 'c2.json',
+              prefix: 'agy_p1_1_1',
+              initialPrefix: 'agy_p1_1_1',
+              label: 'agy_p1_1_1',
+              isRoot: false,
+            },
+          },
+        ],
+        [
+          { id: 'e1', source: 'p1.json', target: 'c1.json' },
+          { id: 'e2', source: 'c1.json', target: 'c2.json' }, // c1 has descendant c2!
+        ]
+      );
+
+      // Attempting to disconnect c1 while c1 still has descendant c2 MUST be rejected
+      const next = graphReducer(state, { type: 'DISCONNECT_NODE', nodeId: 'c1.json' });
+
+      // Edges and nodes remain 100% untouched
+      expect(next.edges).toHaveLength(2);
+      const c1 = next.nodes.find((n) => n.id === 'c1.json');
+      expect(c1.data.prefix).toBe('agy_p1_1');
+      expect(c1.data.label).toBe('agy_p1_1');
+    });
+
+    it('REMOVE_EDGES removes edge and clears target node prefix atomically', () => {
+      const state = createInitialGraphState(
+        [
+          {
+            id: 'p1.json',
+            data: { fileName: 'p1.json', prefix: 'agy_p1', initialPrefix: 'agy_p1', isRoot: true },
+          },
+          {
+            id: 'c1.json',
+            data: {
+              fileName: 'c1.json',
+              prefix: 'agy_p1_1',
+              initialPrefix: 'agy_p1_1',
+              label: 'agy_p1_1',
+              isRoot: false,
+            },
+          },
+        ],
+        [{ id: 'edge__p1-c1', source: 'p1.json', target: 'c1.json' }]
+      );
+
+      const next = graphReducer(state, {
+        type: 'REMOVE_EDGES',
+        edgeIds: ['edge__p1-c1'],
+      });
+
+      expect(next.edges).toHaveLength(0);
+      const c1 = next.nodes.find((n) => n.id === 'c1.json');
+      expect(c1.data.prefix).toBe('');
+      expect(c1.data.label).toBe('c1.json');
+      expect(c1.data.isDirty).toBe(true);
+    });
+
+    it('REMOVE_EDGES protects against descendant guard and preserves original state for rejected removal', () => {
+      const state = createInitialGraphState(
+        [
+          { id: 'p1', data: { prefix: 'agy_p1' } },
+          { id: 'c1', data: { prefix: 'agy_p1_1' } },
+          { id: 'c2', data: { prefix: 'agy_p1_1_1' } },
+        ],
+        [
+          { id: 'e1', source: 'p1', target: 'c1' },
+          { id: 'e2', source: 'c1', target: 'c2' },
+        ]
+      );
+
+      // Only e1 requested for removal: target c1 has surviving descendant e2
+      const next = graphReducer(state, {
+        type: 'REMOVE_EDGES',
+        edgeIds: ['e1'],
+      });
+
+      // Guard blocks removal, state preserved
+      expect(next.edges).toHaveLength(2);
+      expect(next.nodes.find((n) => n.id === 'c1').data.prefix).toBe('agy_p1_1');
+    });
+
+    it('REMOVE_EDGES safely removes both parent and child edges in a batch removal', () => {
+      const state = createInitialGraphState(
+        [
+          { id: 'p1', data: { prefix: 'agy_p1' } },
+          { id: 'c1', data: { prefix: 'agy_p1_1', initialPrefix: 'agy_p1_1' } },
+          { id: 'c2', data: { prefix: 'agy_p1_1_1', initialPrefix: 'agy_p1_1_1' } },
+        ],
+        [
+          { id: 'e1', source: 'p1', target: 'c1' },
+          { id: 'e2', source: 'c1', target: 'c2' },
+        ]
+      );
+
+      // Batch removal of e1 and e2 together: both can be removed
+      const next = graphReducer(state, {
+        type: 'REMOVE_EDGES',
+        edgeIds: ['e1', 'e2'],
+      });
+
+      expect(next.edges).toHaveLength(0);
+      expect(next.nodes.find((n) => n.id === 'c1').data.prefix).toBe('');
+      expect(next.nodes.find((n) => n.id === 'c2').data.prefix).toBe('');
+    });
+
+    it('handles reconnecting to same parent after disconnect, resetting isDirty when matching initialPrefix', () => {
+      // 1. Initial graph with parent p1 and linked child c1 (initialPrefix 'agy_p1_1')
+      const initial = createInitialGraphState(
+        [
+          {
+            id: 'p1.json',
+            data: { fileName: 'p1.json', prefix: 'agy_p1', initialPrefix: 'agy_p1', isRoot: true },
+          },
+          {
+            id: 'c1.json',
+            data: {
+              fileName: 'c1.json',
+              prefix: 'agy_p1_1',
+              initialPrefix: 'agy_p1_1',
+              label: 'agy_p1_1',
+              isRoot: false,
+              isDirty: false,
+            },
+          },
+        ],
+        [{ id: 'e1', source: 'p1.json', target: 'c1.json' }]
+      );
+
+      // 2. Disconnect c1
+      const disconnected = graphReducer(initial, {
+        type: 'DISCONNECT_NODE',
+        nodeId: 'c1.json',
+      });
+      const discChild = disconnected.nodes.find((n) => n.id === 'c1.json');
+      expect(discChild.data.prefix).toBe('');
+      expect(discChild.data.isDirty).toBe(true);
+
+      // 3. Reconnect c1 to p1 again
+      const reconnected = graphReducer(disconnected, {
+        type: 'CONNECT',
+        connection: { source: 'p1.json', target: 'c1.json' },
+      });
+      const recChild = reconnected.nodes.find((n) => n.id === 'c1.json');
+      expect(recChild.data.prefix).toBe('agy_p1_1');
+      // DIRTY RESET: matches initialPrefix 'agy_p1_1', so isDirty must reset to false!
+      expect(recChild.data.isDirty).toBe(false);
+      expect(reconnected.edges).toHaveLength(1);
+    });
+
+    it('handles reconnecting to other parent after disconnect, keeping isDirty true', () => {
+      const initial = createInitialGraphState(
+        [
+          {
+            id: 'p1.json',
+            data: { fileName: 'p1.json', prefix: 'agy_p1', initialPrefix: 'agy_p1', isRoot: true },
+          },
+          {
+            id: 'p2.json',
+            data: { fileName: 'p2.json', prefix: 'agy_p2', initialPrefix: 'agy_p2', isRoot: true },
+          },
+          {
+            id: 'c1.json',
+            data: {
+              fileName: 'c1.json',
+              prefix: 'agy_p1_1',
+              initialPrefix: 'agy_p1_1',
+              label: 'agy_p1_1',
+              isRoot: false,
+              isDirty: false,
+            },
+          },
+        ],
+        [{ id: 'e1', source: 'p1.json', target: 'c1.json' }]
+      );
+
+      // Disconnect from p1
+      const disconnected = graphReducer(initial, {
+        type: 'DISCONNECT_NODE',
+        nodeId: 'c1.json',
+      });
+
+      // Reconnect to p2
+      const reconnected = graphReducer(disconnected, {
+        type: 'CONNECT',
+        connection: { source: 'p2.json', target: 'c1.json' },
+      });
+
+      const child = reconnected.nodes.find((n) => n.id === 'c1.json');
+      expect(child.data.prefix).toBe('agy_p2_1');
+      // Differs from initialPrefix 'agy_p1_1', so isDirty must be true!
+      expect(child.data.isDirty).toBe(true);
+    });
+
+    it('handles synthetic demo nodes disconnect and reconnect', () => {
+      const demoState = createInitialGraphState(
+        [
+          { id: 'p1', data: { prefix: 'agy_p1', isRoot: true, isSynthetic: true } },
+          {
+            id: 'c1',
+            data: {
+              prefix: 'unlinked_1',
+              initialPrefix: 'unlinked_1',
+              label: 'unlinked_1',
+              isRoot: false,
+              isSynthetic: true,
+            },
+          },
+        ],
+        []
+      );
+
+      // Connect c1 to p1
+      const connected = graphReducer(demoState, {
+        type: 'CONNECT',
+        connection: { source: 'p1', target: 'c1' },
+      });
+      expect(connected.nodes.find((n) => n.id === 'c1').data.prefix).toBe('agy_p1_1');
+
+      // Disconnect c1
+      const disconnected = graphReducer(connected, {
+        type: 'DISCONNECT_NODE',
+        nodeId: 'c1',
+      });
+      expect(disconnected.edges).toHaveLength(0);
+      const c1 = disconnected.nodes.find((n) => n.id === 'c1');
+      expect(c1.data.prefix).toBe('');
+      expect(c1.data.label).toBe('c1');
+    });
+
+    it('sets graphFeedback on rejected removals and masks email filenames in feedback', () => {
+      const state = createInitialGraphState(
+        [
+          { id: 'p1', data: { prefix: 'agy_p1' } },
+          { id: 'developer.user@openai.com.json', data: { prefix: 'agy_p1_1' } },
+          { id: 'c_deep', data: { prefix: 'agy_p1_1_1' } },
+        ],
+        [
+          { id: 'e1', source: 'p1', target: 'developer.user@openai.com.json' },
+          { id: 'e2', source: 'developer.user@openai.com.json', target: 'c_deep' },
+        ]
+      );
+
+      const next = graphReducer(state, {
+        type: 'DISCONNECT_NODE',
+        nodeId: 'developer.user@openai.com.json',
+      });
+
+      expect(next.edges).toHaveLength(2);
+      expect(next.graphFeedback).toContain('dev...ser@openai.com.json');
+      expect(next.graphFeedback).not.toContain('developer.user@openai.com.json');
+      expect(next.graphFeedback).toContain('with attached descendants');
+    });
+
+    it('clears stale graphFeedback upon subsequent successful removal or action', () => {
+      const stateWithFeedback = {
+        ...createInitialGraphState(
+          [
+            { id: 'p1', data: { prefix: 'agy_p1' } },
+            { id: 'c1', data: { prefix: 'agy_p1_1', initialPrefix: 'agy_p1_1' } },
+          ],
+          [{ id: 'e1', source: 'p1', target: 'c1' }]
+        ),
+        graphFeedback: 'Stale error message from previous rejected action',
+      };
+
+      // Safe removal clears feedback
+      const next = graphReducer(stateWithFeedback, {
+        type: 'REMOVE_EDGES',
+        edgeIds: ['e1'],
+      });
+
+      expect(next.edges).toHaveLength(0);
+      expect(next.graphFeedback).toBeNull();
+    });
+
+    it('handles rapid sequential disconnections on pure state snapshot without false rejection', () => {
+      // 3-tier hierarchy: p1 -> c1 -> c2
+      const state = createInitialGraphState(
+        [
+          { id: 'p1', data: { prefix: 'agy_p1', initialPrefix: 'agy_p1', isRoot: true } },
+          { id: 'c1', data: { prefix: 'agy_p1_1', initialPrefix: 'agy_p1_1', isRoot: false } },
+          { id: 'c2', data: { prefix: 'agy_p1_1_1', initialPrefix: 'agy_p1_1_1', isRoot: false } },
+        ],
+        [
+          { id: 'e1', source: 'p1', target: 'c1' },
+          { id: 'e2', source: 'c1', target: 'c2' },
+        ]
+      );
+
+      // Step 1: Disconnect leaf c2
+      const step1 = graphReducer(state, {
+        type: 'DISCONNECT_NODE',
+        nodeId: 'c2',
+      });
+      expect(step1.edges).toHaveLength(1);
+      expect(step1.nodes.find((n) => n.id === 'c2').data.prefix).toBe('');
+
+      // Step 2: Immediately disconnect c1 without intermediate re-render
+      // Since step1.edges no longer contains e2, c1 has zero descendants!
+      const step2 = graphReducer(step1, {
+        type: 'DISCONNECT_NODE',
+        nodeId: 'c1',
+      });
+      expect(step2.edges).toHaveLength(0);
+      expect(step2.nodes.find((n) => n.id === 'c1').data.prefix).toBe('');
+      expect(step2.graphFeedback).toBeNull();
+    });
+  });
 });

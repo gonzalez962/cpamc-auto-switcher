@@ -2,6 +2,9 @@
  * Pure functions for visual profile graph topology and prefix calculations.
  */
 
+import { maskDisplayIdentifier } from '../api/managementClient';
+export { maskDisplayIdentifier };
+
 /**
  * Calculates the child prefix given a parent prefix and the next sequence number.
  * Preserves the exact parent prefix with all underscores and special characters.
@@ -253,4 +256,97 @@ export function applyConnectionPure(nodes, edges, connection) {
     childPrefix,
     applied: true,
   };
+}
+
+/**
+ * Checks if a target node can be disconnected from its parent.
+ * Disconnecting is blocked if the target has attached outgoing edges (descendants).
+ *
+ * @param {Array<Object>} edges - Current array of edges
+ * @param {string} targetId - ID of the node to disconnect
+ * @returns {{ allowed: boolean, reason?: string, error?: string }}
+ */
+export function canDisconnectTarget(edges, targetId) {
+  if (!targetId) {
+    return { allowed: false, reason: 'missing_target_id', error: 'Invalid target ID.' };
+  }
+  const outgoing = countOutgoingEdges(edges, targetId);
+  if (outgoing > 0) {
+    return {
+      allowed: false,
+      reason: 'target_has_descendants',
+      error: 'Cannot disconnect profile with attached descendants. Disconnect descendants first.',
+    };
+  }
+  return { allowed: true };
+}
+
+/**
+ * Evaluates a batch of requested edge removals against the descendant guard.
+ *
+ * SAFETY INVARIANTS:
+ * - A target node cannot be disconnected from its parent if it still has outgoing edges (attached descendants).
+ * - When multiple edges are removed in a batch (e.g. multi-selection Delete), if a child edge is ALSO
+ *   being removed in the batch, the parent edge may safely proceed (descendant is disconnected too).
+ * - Iteratively prunes candidates until a consistent set of safe removals is determined.
+ * - Rejects any edge removal that would leave an orphaned descendant subtree.
+ * - Original state is preserved for rejected removals.
+ *
+ * @param {Array<Object>} edges - Current array of edges
+ * @param {Array<string>|string} edgeIdsToRemove - Array or single edge ID to remove
+ * @returns {{ safeRemovals: Array<Object>, rejectedRemovals: Array<{ edge: Object, reason: string, error: string }> }}
+ */
+export function partitionEdgeRemovals(edges, edgeIdsToRemove) {
+  const edgeList = Array.isArray(edges) ? edges : [];
+  const requestedList = Array.isArray(edgeIdsToRemove)
+    ? edgeIdsToRemove
+    : [edgeIdsToRemove].filter(Boolean);
+  const requestedSet = new Set(requestedList);
+
+  // Iteratively prune candidates whose targets have surviving outgoing edges
+  let safeEdgeIds = new Set(requestedSet);
+  let changed = true;
+
+  while (changed) {
+    changed = false;
+    for (const edgeId of safeEdgeIds) {
+      const edge = edgeList.find((e) => e && e.id === edgeId);
+      if (!edge) {
+        safeEdgeIds.delete(edgeId);
+        changed = true;
+        continue;
+      }
+
+      const targetId = edge.target;
+      // Target cannot have any surviving outgoing edge in edgeList that is NOT in safeEdgeIds
+      const hasSurvivingOutgoing = edgeList.some(
+        (e) => e && e.source === targetId && !safeEdgeIds.has(e.id)
+      );
+
+      if (hasSurvivingOutgoing) {
+        safeEdgeIds.delete(edgeId);
+        changed = true;
+      }
+    }
+  }
+
+  const safeRemovals = [];
+  const rejectedRemovals = [];
+
+  for (const edgeId of requestedSet) {
+    const edge = edgeList.find((e) => e && e.id === edgeId);
+    if (!edge) continue;
+
+    if (safeEdgeIds.has(edgeId)) {
+      safeRemovals.push(edge);
+    } else {
+      rejectedRemovals.push({
+        edge,
+        reason: 'target_has_descendants',
+        error: `Cannot disconnect profile "${maskDisplayIdentifier(edge.target)}" with attached descendants. Disconnect descendants first.`,
+      });
+    }
+  }
+
+  return { safeRemovals, rejectedRemovals };
 }

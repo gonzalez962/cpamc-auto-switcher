@@ -240,4 +240,235 @@ describe('ProfileNode Component - Inline Editing & Dirty State', () => {
     expect(screen.getByTestId('ambiguity-notice-child-ambig.json')).toBeTruthy();
     expect(screen.getByText(/Multiple accounts share/)).toBeTruthy();
   });
+
+  describe('VP-7 Type Badges, Masked Email & Disconnect Button Interactions', () => {
+    it('renders provider/type badge when accountType is present', () => {
+      renderInProvider(
+        <ProfileNode
+          id="node-type"
+          data={{
+            prefix: 'agy_p1',
+            accountType: 'antigravity',
+          }}
+          isConnectable={true}
+        />
+      );
+
+      const badge = screen.getByTestId('badge-type-node-type');
+      expect(badge).toBeTruthy();
+      expect(badge.textContent).toBe('ANTIGRAVITY');
+    });
+
+    it('renders masked email safely and never exposes full raw email in DOM attributes', () => {
+      renderInProvider(
+        <ProfileNode
+          id="node-email"
+          data={{
+            prefix: 'agy_p1',
+            maskedEmail: 'ant...unt@domain.org',
+          }}
+          isConnectable={true}
+        />
+      );
+
+      const emailEl = screen.getByTestId('profile-node-email-node-email');
+      expect(emailEl).toBeTruthy();
+      expect(emailEl.textContent).toBe('ant...unt@domain.org');
+
+      // Verify DOM tree does not leak any fake raw email
+      const containerHtml = document.body.innerHTML;
+      expect(containerHtml).not.toContain('antigravity.superaccount@domain.org');
+    });
+
+    it('renders Disconnect button only when node has a parent', () => {
+      const { unmount } = renderInProvider(
+        <ProfileNode
+          id="child-with-parent"
+          data={{
+            prefix: 'agy_p1_1',
+            hasParent: true,
+          }}
+          isConnectable={true}
+        />
+      );
+      expect(screen.getByTestId('btn-disconnect-child-with-parent')).toBeTruthy();
+      unmount();
+
+      // Root / unlinked node without parent
+      renderInProvider(
+        <ProfileNode
+          id="root-no-parent"
+          data={{
+            prefix: 'agy_p1',
+            hasParent: false,
+          }}
+          isConnectable={true}
+        />
+      );
+      expect(screen.queryByTestId('btn-disconnect-root-no-parent')).toBeNull();
+    });
+
+    it('blocks disconnect and shows visible error when child has attached descendants', () => {
+      const onDisconnect = vi.fn();
+      renderInProvider(
+        <ProfileNode
+          id="intermediate-child"
+          data={{
+            prefix: 'agy_p1_1',
+            hasParent: true,
+            outgoingCount: 2, // has 2 descendants!
+            onDisconnect,
+          }}
+          isConnectable={true}
+        />
+      );
+
+      const disconnectBtn = screen.getByTestId('btn-disconnect-intermediate-child');
+      fireEvent.click(disconnectBtn);
+
+      // Must NOT invoke onDisconnect
+      expect(onDisconnect).not.toHaveBeenCalled();
+
+      // Must display visible error
+      const errorEl = screen.getByTestId('validation-error-intermediate-child');
+      expect(errorEl).toBeTruthy();
+      expect(errorEl.textContent).toContain(
+        'Cannot disconnect profile with attached descendants. Disconnect descendants first.'
+      );
+    });
+
+    it('successfully invokes onDisconnect when child has zero descendants', () => {
+      const onDisconnect = vi.fn();
+      renderInProvider(
+        <ProfileNode
+          id="leaf-child"
+          data={{
+            prefix: 'agy_p1_1',
+            hasParent: true,
+            outgoingCount: 0, // leaf node
+            onDisconnect,
+          }}
+          isConnectable={true}
+        />
+      );
+
+      const disconnectBtn = screen.getByTestId('btn-disconnect-leaf-child');
+      fireEvent.click(disconnectBtn);
+
+      expect(onDisconnect).toHaveBeenCalledWith('leaf-child');
+      expect(screen.queryByTestId('validation-error-leaf-child')).toBeNull();
+    });
+
+    it('verifies full email is absent from node outerHTML while masked email appears across all generated DOM attributes', () => {
+      renderInProvider(
+        <ProfileNode
+          id="developer.user@openai.com.json"
+          data={{
+            fileName: 'developer.user@openai.com.json',
+            prefix: 'agy_p1',
+            maskedEmail: 'dev...ser@openai.com',
+            hasParent: true,
+            accountType: 'openai',
+          }}
+          isConnectable={true}
+        />
+      );
+
+      // Verify node is queryable by its safe masked testid
+      const nodeEl = screen.getByTestId('profile-node-dev...ser@openai.com.json');
+      expect(nodeEl).toBeTruthy();
+
+      // Check outerHTML for our generated component DOM tree
+      const outerHtml = nodeEl.outerHTML;
+
+      // 1. Full raw email local part and full raw email are completely absent from our generated DOM
+      expect(outerHtml).not.toContain('developer.user@openai.com');
+      expect(outerHtml).not.toContain('developer.user');
+
+      // 2. Safe masked email appears in header, title tooltip, and email subheader
+      expect(outerHtml).toContain('dev...ser@openai.com.json');
+      expect(outerHtml).toContain('dev...ser@openai.com');
+      expect(outerHtml).toContain('data-testid="profile-node-dev...ser@openai.com.json"');
+      expect(outerHtml).toContain('data-testid="badge-type-dev...ser@openai.com.json"');
+      expect(outerHtml).toContain('data-testid="profile-node-email-dev...ser@openai.com.json"');
+      expect(outerHtml).toContain('data-testid="btn-edit-prefix-dev...ser@openai.com.json"');
+      expect(outerHtml).toContain('data-testid="btn-disconnect-dev...ser@openai.com.json"');
+    });
+
+    it('masks raw email in ambiguous parent badge title and footer notice tooltip', () => {
+      renderInProvider(
+        <ProfileNode
+          id="child-with-ambig"
+          data={{
+            prefix: 'agy_p1_1',
+            ambiguousParent: {
+              parentPrefix: 'agy_p1',
+              candidateCount: 2,
+              candidateNames: [
+                'developer.user@openai.com.json',
+                'antigravity-user.name@provider.org.json',
+              ],
+            },
+          }}
+          isConnectable={true}
+        />
+      );
+
+      // Ambiguous badge title has masked emails
+      const badge = screen.getByTestId('badge-ambiguous-child-with-ambig');
+      expect(badge.getAttribute('title')).toContain('dev...ser@openai.com.json');
+      expect(badge.getAttribute('title')).toContain('antigravity-use...ame@provider.org.json');
+
+      // Footer notice title has masked emails
+      const notice = screen.getByTestId('ambiguity-notice-child-with-ambig');
+      const noticeText = notice.querySelector('.profile-node-subtext');
+      expect(noticeText.getAttribute('title')).toContain('dev...ser@openai.com.json');
+      expect(noticeText.getAttribute('title')).toContain('antigravity-use...ame@provider.org.json');
+
+      // Raw unmasked emails are not in tooltips
+      expect(badge.getAttribute('title')).not.toContain('developer.user@openai.com.json');
+      expect(noticeText.getAttribute('title')).not.toContain('antigravity-user.name@provider.org.json');
+    });
+
+    it('blocks inline editing on intermediate child nodes with outgoingCount > 0 irrespective of isRoot', () => {
+      const onPrefixChange = vi.fn();
+      renderInProvider(
+        <ProfileNode
+          id="intermediate-child"
+          data={{
+            prefix: 'agy_p1_1',
+            label: 'agy_p1_1',
+            isRoot: false, // Child node!
+            outgoingCount: 2, // But has descendants!
+            hasParent: true,
+            onPrefixChange,
+          }}
+          isConnectable={true}
+        />
+      );
+
+      // Edit button has descriptive guard title
+      const editBtn = screen.getByTestId('btn-edit-prefix-intermediate-child');
+      expect(editBtn.getAttribute('title')).toBe('Cannot rename parent with attached children');
+
+      // Clicking edit immediately reveals the rename guard explanation
+      fireEvent.click(editBtn);
+      const errorEl = screen.getByTestId('validation-error-intermediate-child');
+      expect(errorEl).toBeTruthy();
+      expect(errorEl.textContent).toBe(
+        'Cannot rename parent with attached children. Disconnect children first.'
+      );
+
+      // Attempting to change prefix and save is strictly blocked
+      const input = screen.getByTestId('input-prefix-intermediate-child');
+      fireEvent.change(input, { target: { value: 'agy_renamed_child' } });
+      const saveBtn = screen.getByTestId('btn-save-prefix-intermediate-child');
+      fireEvent.click(saveBtn);
+
+      expect(onPrefixChange).not.toHaveBeenCalled();
+      expect(
+        screen.getByText('Cannot rename parent with attached children. Disconnect children first.')
+      ).toBeTruthy();
+    });
+  });
 });

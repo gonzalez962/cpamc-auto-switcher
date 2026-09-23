@@ -6,6 +6,8 @@ import {
   getEdgeId,
   validateConnection,
   applyConnectionPure,
+  canDisconnectTarget,
+  partitionEdgeRemovals,
 } from './connection';
 
 describe('calculateChildPrefix', () => {
@@ -200,5 +202,92 @@ describe('applyConnectionPure', () => {
     expect(step3.applied).toBe(true);
     expect(step3.childPrefix).toBe('agy_p1_3');
     expect(step3.nodes.find((n) => n.id === 'c3').data.prefix).toBe('agy_p1_3');
+  });
+
+  describe('VP-7 Descendant Guards & Batch Edge Removal Partitioning', () => {
+    it('canDisconnectTarget permits disconnecting leaf child without outgoing edges', () => {
+      const edges = [
+        { id: 'e1', source: 'p1', target: 'c1' },
+      ];
+      expect(canDisconnectTarget(edges, 'c1')).toEqual({ allowed: true });
+    });
+
+    it('canDisconnectTarget blocks disconnecting node that has outgoing edges (descendants)', () => {
+      const edges = [
+        { id: 'e1', source: 'p1', target: 'c1' },
+        { id: 'e2', source: 'c1', target: 'c2' },
+      ];
+      const result = canDisconnectTarget(edges, 'c1');
+      expect(result.allowed).toBe(false);
+      expect(result.reason).toBe('target_has_descendants');
+      expect(result.error).toContain('Cannot disconnect profile with attached descendants');
+    });
+
+    it('partitionEdgeRemovals safely accepts leaf edge removal', () => {
+      const edges = [
+        { id: 'e1', source: 'p1', target: 'c1' },
+        { id: 'e2', source: 'p1', target: 'c2' },
+      ];
+      const { safeRemovals, rejectedRemovals } = partitionEdgeRemovals(edges, ['e1']);
+      expect(safeRemovals).toHaveLength(1);
+      expect(safeRemovals[0].id).toBe('e1');
+      expect(rejectedRemovals).toHaveLength(0);
+    });
+
+    it('partitionEdgeRemovals rejects non-leaf edge removal when descendants are not in batch', () => {
+      const edges = [
+        { id: 'e1', source: 'p1', target: 'c1' },
+        { id: 'e2', source: 'c1', target: 'c2' },
+      ];
+      // Only e1 requested: c1 has descendant e2 that remains
+      const { safeRemovals, rejectedRemovals } = partitionEdgeRemovals(edges, ['e1']);
+      expect(safeRemovals).toHaveLength(0);
+      expect(rejectedRemovals).toHaveLength(1);
+      expect(rejectedRemovals[0].edge.id).toBe('e1');
+      expect(rejectedRemovals[0].reason).toBe('target_has_descendants');
+    });
+
+    it('partitionEdgeRemovals permits removing parent edge if child edge is also in removal batch', () => {
+      const edges = [
+        { id: 'e1', source: 'p1', target: 'c1' },
+        { id: 'e2', source: 'c1', target: 'c2' },
+      ];
+      // Both e1 and e2 requested in same batch
+      const { safeRemovals, rejectedRemovals } = partitionEdgeRemovals(edges, ['e1', 'e2']);
+      expect(safeRemovals).toHaveLength(2);
+      expect(rejectedRemovals).toHaveLength(0);
+    });
+
+    it('partitionEdgeRemovals cascades rejection in a 3-tier chain when deep descendant is missing from batch', () => {
+      const edges = [
+        { id: 'e1', source: 'p1', target: 'c1' },
+        { id: 'e2', source: 'c1', target: 'c2' },
+      ];
+      const edgesChain = [
+        { id: 'e1', source: 'p1', target: 'c1' },
+        { id: 'e2', source: 'c1', target: 'c2' },
+        { id: 'e3', source: 'c2', target: 'c3' },
+      ];
+      // e1 and e2 requested, but e3 (c2's child) is NOT requested
+      const { safeRemovals, rejectedRemovals } = partitionEdgeRemovals(edgesChain, ['e1', 'e2']);
+      // e2 is rejected because c2 still has e3. Consequently e1 is rejected because c1 still has e2.
+      expect(safeRemovals).toHaveLength(0);
+      expect(rejectedRemovals).toHaveLength(2);
+    });
+
+    it('partitionEdgeRemovals partitions mixed independent removals: accepts safe and rejects guarded', () => {
+      const edges = [
+        { id: 'e_safe', source: 'p1', target: 'c_leaf' },
+        { id: 'e_guarded', source: 'p2', target: 'c_parent' },
+        { id: 'e_child', source: 'c_parent', target: 'c_deep' },
+      ];
+      // Requesting e_safe and e_guarded (e_child is NOT requested)
+      const { safeRemovals, rejectedRemovals } = partitionEdgeRemovals(edges, [
+        'e_safe',
+        'e_guarded',
+      ]);
+      expect(safeRemovals.map((e) => e.id)).toEqual(['e_safe']);
+      expect(rejectedRemovals.map((r) => r.edge.id)).toEqual(['e_guarded']);
+    });
   });
 });

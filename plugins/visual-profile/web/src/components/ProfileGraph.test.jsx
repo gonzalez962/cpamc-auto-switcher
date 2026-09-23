@@ -1203,5 +1203,589 @@ describe('ProfileGraph Component and onConnect Integration', () => {
       expect(screen.getByText('other_init')).toBeTruthy();
       expect(screen.queryByText('other_dirty')).toBeNull();
     });
+
+    it('regression: in-flight disconnect while save is pending preserves prefix and edge coherence in baseline upon reset', async () => {
+      vi.spyOn(window, 'confirm').mockReturnValue(true);
+      let resolveSave;
+      const savePromise = new Promise((resolve) => {
+        resolveSave = resolve;
+      });
+      const mockFetch = vi.fn().mockReturnValue(
+        savePromise.then(() => ({
+          ok: true,
+          status: 200,
+          json: async () => ({ ok: true }),
+        }))
+      );
+
+      const nodes = [
+        {
+          id: 'p1.json',
+          type: 'profile',
+          position: { x: 50, y: 50 },
+          data: {
+            prefix: 'agy_p1',
+            initialPrefix: 'agy_p1',
+            label: 'agy_p1',
+            fileName: 'p1.json',
+            isRoot: true,
+            isDirty: false,
+            isSynthetic: false,
+          },
+        },
+        {
+          id: 'c1.json',
+          type: 'profile',
+          position: { x: 50, y: 250 },
+          data: {
+            prefix: '',
+            initialPrefix: '',
+            label: 'c1.json',
+            fileName: 'c1.json',
+            isRoot: false,
+            isDirty: false,
+            isSynthetic: false,
+          },
+        },
+      ];
+
+      const graphRef = React.createRef();
+      render(
+        <ProfileGraph
+          ref={graphRef}
+          initialNodes={nodes}
+          initialEdges={[]}
+          allowSynthetic={false}
+          apiOptions={{ key: 'test-key', fetchFn: mockFetch }}
+        />
+      );
+
+      // Connect p1 to c1 -> assigns prefix agy_p1_1, marks isDirty: true
+      act(() => {
+        graphRef.current.connect({ source: 'p1.json', target: 'c1.json' });
+      });
+      expect(graphRef.current.getEdges()).toHaveLength(1);
+      expect(graphRef.current.getNodes().find((n) => n.id === 'c1.json').data.prefix).toBe('agy_p1_1');
+      expect(graphRef.current.isDirty()).toBe(true);
+
+      // Trigger Save Changes (persisting prefix agy_p1_1 for c1.json)
+      act(() => {
+        fireEvent.click(screen.getByTestId('btn-save-changes'));
+      });
+      expect(graphRef.current.isSaving()).toBe(true);
+
+      // WHILE SAVE IS IN FLIGHT: disconnect child c1.json via Disconnect button
+      fireEvent.click(screen.getByTestId('btn-disconnect-c1.json'));
+      // In active draft, c1 is disconnected and prefix is cleared
+      expect(graphRef.current.getEdges()).toHaveLength(0);
+      expect(graphRef.current.getNodes().find((n) => n.id === 'c1.json').data.prefix).toBe('');
+
+      // Resolve the async save
+      await act(async () => {
+        resolveSave();
+      });
+      expect(graphRef.current.isSaving()).toBe(false);
+
+      // In active graph after save, draft disconnect is preserved:
+      // c1 still has draft prefix "" and isDirty true (against new server initialPrefix agy_p1_1)
+      const draftChild = graphRef.current.getNodes().find((n) => n.id === 'c1.json');
+      expect(draftChild.data.prefix).toBe('');
+      expect(draftChild.data.initialPrefix).toBe('agy_p1_1');
+      expect(draftChild.data.isDirty).toBe(true);
+      expect(graphRef.current.getEdges()).toHaveLength(0);
+
+      // Reset graph: baseline MUST restore the coherent server-saved state (both prefix AND edge)
+      fireEvent.click(screen.getByTestId('btn-reset-graph'));
+
+      // Verify prefix/edge coherence: child prefix agy_p1_1 MUST have its incoming parent edge p1 -> c1
+      expect(graphRef.current.getEdges()).toHaveLength(1);
+      expect(graphRef.current.getEdges()[0].source).toBe('p1.json');
+      expect(graphRef.current.getEdges()[0].target).toBe('c1.json');
+
+      const resetChild = graphRef.current.getNodes().find((n) => n.id === 'c1.json');
+      expect(resetChild.data.prefix).toBe('agy_p1_1');
+      expect(resetChild.data.initialPrefix).toBe('agy_p1_1');
+      expect(resetChild.data.isDirty).toBe(false);
+      expect(graphRef.current.isDirty()).toBe(false);
+    });
+  });
+
+  describe('VP-7 Edge Disconnect, Descendant Guard, and Empty Prefix Save Integration', () => {
+    it('disconnects child via visible Disconnect button, clearing prefix to empty and marking isDirty', () => {
+      const realNodes = [
+        {
+          id: 'p1.json',
+          type: 'profile',
+          position: { x: 50, y: 50 },
+          data: {
+            fileName: 'p1.json',
+            prefix: 'agy_p1',
+            initialPrefix: 'agy_p1',
+            label: 'agy_p1',
+            isRoot: true,
+            isDirty: false,
+          },
+        },
+        {
+          id: 'c1.json',
+          type: 'profile',
+          position: { x: 50, y: 250 },
+          data: {
+            fileName: 'c1.json',
+            prefix: 'agy_p1_1',
+            initialPrefix: 'agy_p1_1',
+            label: 'agy_p1_1',
+            isRoot: false,
+            isDirty: false,
+          },
+        },
+      ];
+      const realEdges = [
+        { id: 'edge__p1.json-c1.json', source: 'p1.json', target: 'c1.json' },
+      ];
+
+      const graphRef = React.createRef();
+      render(
+        <ProfileGraph
+          ref={graphRef}
+          initialNodes={realNodes}
+          initialEdges={realEdges}
+          allowSynthetic={false}
+        />
+      );
+
+      // Child has visible Disconnect button
+      const disconnectBtn = screen.getByTestId('btn-disconnect-c1.json');
+      expect(disconnectBtn).toBeTruthy();
+
+      fireEvent.click(disconnectBtn);
+
+      // Edge is removed atomically
+      expect(graphRef.current.getEdges()).toHaveLength(0);
+
+      // Child prefix cleared, isDirty set to true
+      const c1 = graphRef.current.getNodes().find((n) => n.id === 'c1.json');
+      expect(c1.data.prefix).toBe('');
+      expect(c1.data.label).toBe('c1.json');
+      expect(c1.data.isDirty).toBe(true);
+      expect(graphRef.current.isDirty()).toBe(true);
+      expect(screen.getByTestId('stats-dirty-count').textContent).toContain('1');
+    });
+
+    it('removes edge via removeEdges imperative handle and clears child prefix to empty', () => {
+      const realNodes = [
+        {
+          id: 'p1.json',
+          type: 'profile',
+          position: { x: 50, y: 50 },
+          data: { fileName: 'p1.json', prefix: 'agy_p1', initialPrefix: 'agy_p1', isRoot: true },
+        },
+        {
+          id: 'c1.json',
+          type: 'profile',
+          position: { x: 50, y: 250 },
+          data: { fileName: 'c1.json', prefix: 'agy_p1_1', initialPrefix: 'agy_p1_1', isRoot: false },
+        },
+      ];
+      const realEdges = [
+        { id: 'e1', source: 'p1.json', target: 'c1.json' },
+      ];
+
+      const graphRef = React.createRef();
+      render(
+        <ProfileGraph
+          ref={graphRef}
+          initialNodes={realNodes}
+          initialEdges={realEdges}
+          allowSynthetic={false}
+        />
+      );
+
+      act(() => {
+        graphRef.current.removeEdges(['e1']);
+      });
+
+      expect(graphRef.current.getEdges()).toHaveLength(0);
+      const c1 = graphRef.current.getNodes().find((n) => n.id === 'c1.json');
+      expect(c1.data.prefix).toBe('');
+      expect(c1.data.isDirty).toBe(true);
+    });
+
+    it('blocks disconnect and shows feedback banner when child has attached descendants', () => {
+      const realNodes = [
+        {
+          id: 'p1.json',
+          type: 'profile',
+          position: { x: 50, y: 50 },
+          data: { fileName: 'p1.json', prefix: 'agy_p1', initialPrefix: 'agy_p1', isRoot: true },
+        },
+        {
+          id: 'c1.json',
+          type: 'profile',
+          position: { x: 50, y: 200 },
+          data: { fileName: 'c1.json', prefix: 'agy_p1_1', initialPrefix: 'agy_p1_1', isRoot: false },
+        },
+        {
+          id: 'c2.json',
+          type: 'profile',
+          position: { x: 50, y: 350 },
+          data: { fileName: 'c2.json', prefix: 'agy_p1_1_1', initialPrefix: 'agy_p1_1_1', isRoot: false },
+        },
+      ];
+      const realEdges = [
+        { id: 'e1', source: 'p1.json', target: 'c1.json' },
+        { id: 'e2', source: 'c1.json', target: 'c2.json' },
+      ];
+
+      const graphRef = React.createRef();
+      render(
+        <ProfileGraph
+          ref={graphRef}
+          initialNodes={realNodes}
+          initialEdges={realEdges}
+          allowSynthetic={false}
+        />
+      );
+
+      // Attempting to disconnect c1 via button
+      const disconnectBtn = screen.getByTestId('btn-disconnect-c1.json');
+      fireEvent.click(disconnectBtn);
+
+      // Guard blocks: feedback banner is rendered
+      expect(screen.getByTestId('validation-error-c1.json')).toBeTruthy();
+      expect(screen.getByText(/Cannot disconnect profile with attached descendants/)).toBeTruthy();
+
+      // State is preserved completely
+      expect(graphRef.current.getEdges()).toHaveLength(2);
+      expect(graphRef.current.getNodes().find((n) => n.id === 'c1.json').data.prefix).toBe('agy_p1_1');
+    });
+
+    it('removeEdges batch rejects guarded edge while allowing leaf edge', () => {
+      const realNodes = [
+        {
+          id: 'p1.json',
+          type: 'profile',
+          position: { x: 50, y: 50 },
+          data: { fileName: 'p1.json', prefix: 'agy_p1', initialPrefix: 'agy_p1', isRoot: true },
+        },
+        {
+          id: 'c_mid.json',
+          type: 'profile',
+          position: { x: 50, y: 200 },
+          data: { fileName: 'c_mid.json', prefix: 'agy_p1_1', initialPrefix: 'agy_p1_1', isRoot: false },
+        },
+        {
+          id: 'c_deep.json',
+          type: 'profile',
+          position: { x: 50, y: 350 },
+          data: { fileName: 'c_deep.json', prefix: 'agy_p1_1_1', initialPrefix: 'agy_p1_1_1', isRoot: false },
+        },
+        {
+          id: 'c_leaf.json',
+          type: 'profile',
+          position: { x: 250, y: 200 },
+          data: { fileName: 'c_leaf.json', prefix: 'agy_p1_2', initialPrefix: 'agy_p1_2', isRoot: false },
+        },
+      ];
+      const realEdges = [
+        { id: 'e_guarded', source: 'p1.json', target: 'c_mid.json' },
+        { id: 'e_child', source: 'c_mid.json', target: 'c_deep.json' },
+        { id: 'e_leaf', source: 'p1.json', target: 'c_leaf.json' },
+      ];
+
+      const graphRef = React.createRef();
+      render(
+        <ProfileGraph
+          ref={graphRef}
+          initialNodes={realNodes}
+          initialEdges={realEdges}
+          allowSynthetic={false}
+        />
+      );
+
+      // Attempt batch removal of e_guarded and e_leaf
+      act(() => {
+        graphRef.current.removeEdges(['e_guarded', 'e_leaf']);
+      });
+
+      // e_leaf is safely removed; e_guarded is preserved because c_mid still has e_child
+      const edges = graphRef.current.getEdges();
+      expect(edges.some((e) => e.id === 'e_leaf')).toBe(false);
+      expect(edges.some((e) => e.id === 'e_guarded')).toBe(true);
+
+      // c_leaf prefix cleared
+      expect(graphRef.current.getNodes().find((n) => n.id === 'c_leaf.json').data.prefix).toBe('');
+      // c_mid prefix preserved
+      expect(graphRef.current.getNodes().find((n) => n.id === 'c_mid.json').data.prefix).toBe('agy_p1_1');
+
+      // Feedback banner rendered for rejected removal
+      expect(screen.getByTestId('graph-feedback-banner')).toBeTruthy();
+      expect(screen.getByText(/Cannot disconnect profile\(s\) \[c_mid\.json\]/)).toBeTruthy();
+    });
+
+    it('reconnecting child to same parent after disconnect resets isDirty to false', () => {
+      const realNodes = [
+        {
+          id: 'p1.json',
+          type: 'profile',
+          position: { x: 50, y: 50 },
+          data: { fileName: 'p1.json', prefix: 'agy_p1', initialPrefix: 'agy_p1', isRoot: true },
+        },
+        {
+          id: 'c1.json',
+          type: 'profile',
+          position: { x: 50, y: 250 },
+          data: { fileName: 'c1.json', prefix: 'agy_p1_1', initialPrefix: 'agy_p1_1', isRoot: false },
+        },
+      ];
+      const realEdges = [
+        { id: 'e1', source: 'p1.json', target: 'c1.json' },
+      ];
+
+      const graphRef = React.createRef();
+      render(
+        <ProfileGraph
+          ref={graphRef}
+          initialNodes={realNodes}
+          initialEdges={realEdges}
+          allowSynthetic={false}
+        />
+      );
+
+      // 1. Disconnect child
+      fireEvent.click(screen.getByTestId('btn-disconnect-c1.json'));
+      expect(graphRef.current.isDirty()).toBe(true);
+
+      // 2. Reconnect child to same parent p1.json
+      act(() => {
+        graphRef.current.connect({ source: 'p1.json', target: 'c1.json' });
+      });
+
+      // Prefix is restored to agy_p1_1 matching initialPrefix, so isDirty resets to false!
+      const c1 = graphRef.current.getNodes().find((n) => n.id === 'c1.json');
+      expect(c1.data.prefix).toBe('agy_p1_1');
+      expect(c1.data.isDirty).toBe(false);
+      expect(graphRef.current.isDirty()).toBe(false);
+    });
+
+    it('explicit Save Changes persists empty prefix via PATCH {name, prefix: ""} and reconciles initialPrefix', async () => {
+      let capturedPayload = null;
+      const mockFetch = vi.fn().mockImplementation((url, opts) => {
+        capturedPayload = JSON.parse(opts.body);
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ status: 'ok' }),
+        });
+      });
+
+      const realNodes = [
+        {
+          id: 'c1.json',
+          type: 'profile',
+          position: { x: 50, y: 250 },
+          data: {
+            fileName: 'c1.json',
+            prefix: 'agy_p1_1',
+            initialPrefix: 'agy_p1_1',
+            label: 'agy_p1_1',
+            isRoot: false,
+            isDirty: false,
+            isSynthetic: false,
+          },
+        },
+      ];
+      const realEdges = [
+        { id: 'e1', source: 'p1.json', target: 'c1.json' },
+      ];
+
+      const graphRef = React.createRef();
+      render(
+        <ProfileGraph
+          ref={graphRef}
+          initialNodes={realNodes}
+          initialEdges={realEdges}
+          allowSynthetic={false}
+          apiOptions={{ key: 'test-key', fetchFn: mockFetch }}
+        />
+      );
+
+      // Disconnect child
+      fireEvent.click(screen.getByTestId('btn-disconnect-c1.json'));
+      expect(graphRef.current.isDirty()).toBe(true);
+      expect(graphRef.current.getNodes().find((n) => n.id === 'c1.json').data.prefix).toBe('');
+
+      // Click explicit Save Changes button
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('btn-save-changes'));
+      });
+
+      // Verify exact payload sent to Management API PATCH
+      expect(capturedPayload).toEqual({
+        name: 'c1.json',
+        prefix: '',
+      });
+
+      // Verify node state after reconciliation: initialPrefix is now '', isDirty is false
+      expect(graphRef.current.isDirty()).toBe(false);
+      const c1 = graphRef.current.getNodes().find((n) => n.id === 'c1.json');
+      expect(c1.data.initialPrefix).toBe('');
+      expect(c1.data.prefix).toBe('');
+      expect(c1.data.isDirty).toBe(false);
+      expect(screen.getByTestId('save-status-success')).toBeTruthy();
+    });
+
+    it('masks email addresses in graph feedback banner when edge removal is rejected', () => {
+      const realNodes = [
+        {
+          id: 'p1.json',
+          type: 'profile',
+          position: { x: 50, y: 50 },
+          data: { fileName: 'p1.json', prefix: 'agy_p1', initialPrefix: 'agy_p1', isRoot: true },
+        },
+        {
+          id: 'developer.user@openai.com.json',
+          type: 'profile',
+          position: { x: 50, y: 200 },
+          data: {
+            fileName: 'developer.user@openai.com.json',
+            prefix: 'agy_p1_1',
+            initialPrefix: 'agy_p1_1',
+            isRoot: false,
+          },
+        },
+        {
+          id: 'c_deep.json',
+          type: 'profile',
+          position: { x: 50, y: 350 },
+          data: { fileName: 'c_deep.json', prefix: 'agy_p1_1_1', initialPrefix: 'agy_p1_1_1', isRoot: false },
+        },
+      ];
+      const realEdges = [
+        { id: 'e_guarded', source: 'p1.json', target: 'developer.user@openai.com.json' },
+        { id: 'e_child', source: 'developer.user@openai.com.json', target: 'c_deep.json' },
+      ];
+
+      const graphRef = React.createRef();
+      render(
+        <ProfileGraph
+          ref={graphRef}
+          initialNodes={realNodes}
+          initialEdges={realEdges}
+          allowSynthetic={false}
+        />
+      );
+
+      act(() => {
+        graphRef.current.removeEdges(['e_guarded']);
+      });
+
+      // Feedback banner rendered with masked email identifier
+      const banner = screen.getByTestId('graph-feedback-banner');
+      expect(banner).toBeTruthy();
+      expect(screen.getByText(/Cannot disconnect profile\(s\) \[dev\.\.\.ser@openai\.com\.json\]/)).toBeTruthy();
+
+      // Crucial: verify raw unmasked email is not in the banner content
+      expect(banner.textContent).not.toContain('developer.user@openai.com.json');
+    });
+
+    it('clears stale graph feedback banner automatically upon subsequent successful action', () => {
+      const realNodes = [
+        {
+          id: 'p1.json',
+          type: 'profile',
+          position: { x: 50, y: 50 },
+          data: { fileName: 'p1.json', prefix: 'agy_p1', isRoot: true },
+        },
+        {
+          id: 'c_mid.json',
+          type: 'profile',
+          position: { x: 50, y: 200 },
+          data: { fileName: 'c_mid.json', prefix: 'agy_p1_1', isRoot: false },
+        },
+        {
+          id: 'c_leaf.json',
+          type: 'profile',
+          position: { x: 50, y: 350 },
+          data: { fileName: 'c_leaf.json', prefix: 'agy_p1_1_1', isRoot: false },
+        },
+      ];
+      const realEdges = [
+        { id: 'e_mid', source: 'p1.json', target: 'c_mid.json' },
+        { id: 'e_leaf', source: 'c_mid.json', target: 'c_leaf.json' },
+      ];
+
+      const graphRef = React.createRef();
+      render(
+        <ProfileGraph
+          ref={graphRef}
+          initialNodes={realNodes}
+          initialEdges={realEdges}
+          allowSynthetic={false}
+        />
+      );
+
+      // 1. Attempt invalid removal of e_mid while c_leaf is attached -> banner appears
+      act(() => {
+        graphRef.current.removeEdges(['e_mid']);
+      });
+      expect(screen.getByTestId('graph-feedback-banner')).toBeTruthy();
+
+      // 2. Perform a successful removal of e_leaf -> banner is automatically cleared!
+      act(() => {
+        graphRef.current.removeEdges(['e_leaf']);
+      });
+      expect(screen.queryByTestId('graph-feedback-banner')).toBeNull();
+      expect(graphRef.current.getEdges().some((e) => e.id === 'e_leaf')).toBe(false);
+    });
+
+    it('handles batched rapid disconnections without stale closure false rejections', () => {
+      const realNodes = [
+        {
+          id: 'p1.json',
+          type: 'profile',
+          position: { x: 50, y: 50 },
+          data: { fileName: 'p1.json', prefix: 'agy_p1', initialPrefix: 'agy_p1', isRoot: true },
+        },
+        {
+          id: 'c1.json',
+          type: 'profile',
+          position: { x: 50, y: 200 },
+          data: { fileName: 'c1.json', prefix: 'agy_p1_1', initialPrefix: 'agy_p1_1', isRoot: false },
+        },
+        {
+          id: 'c2.json',
+          type: 'profile',
+          position: { x: 50, y: 350 },
+          data: { fileName: 'c2.json', prefix: 'agy_p1_1_1', initialPrefix: 'agy_p1_1_1', isRoot: false },
+        },
+      ];
+      const realEdges = [
+        { id: 'e1', source: 'p1.json', target: 'c1.json' },
+        { id: 'e2', source: 'c1.json', target: 'c2.json' },
+      ];
+
+      const graphRef = React.createRef();
+      render(
+        <ProfileGraph
+          ref={graphRef}
+          initialNodes={realNodes}
+          initialEdges={realEdges}
+          allowSynthetic={false}
+        />
+      );
+
+      // Rapidly disconnect c2 then c1 without waiting for full re-render cycles
+      act(() => {
+        graphRef.current.disconnectNode('c2.json');
+        graphRef.current.disconnectNode('c1.json');
+      });
+
+      // Both edges must be removed safely; c1 must NOT be falsely rejected by stale closure
+      expect(graphRef.current.getEdges()).toHaveLength(0);
+      expect(graphRef.current.getNodes().find((n) => n.id === 'c1.json').data.prefix).toBe('');
+      expect(graphRef.current.getNodes().find((n) => n.id === 'c2.json').data.prefix).toBe('');
+      expect(screen.queryByTestId('graph-feedback-banner')).toBeNull();
+    });
   });
 });

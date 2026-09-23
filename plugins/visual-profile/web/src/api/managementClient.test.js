@@ -12,6 +12,9 @@ import {
   sanitizeFileName,
   patchAuthFilePrefix,
   saveAuthFilePrefixes,
+  abbreviateEmail,
+  extractSafeMaskedEmail,
+  maskDisplayIdentifier,
 } from './managementClient';
 
 describe('Management API Client - Auth & Security Invariants', () => {
@@ -731,5 +734,188 @@ describe('saveAuthFilePrefixes - Multi-File Staging and Non-Atomic Partial Failu
     expect(result.failed.length).toBe(1);
     expect(result.failed[0].name).toBe('conflict.json');
     expect(result.failed[0].error).toContain('409 Conflict');
+  });
+
+  describe('VP-7 Display Metadata, Type Fallback, and Masked Email Conventions', () => {
+    it('abbreviates email with local part <= 6 characters unchanged matching cmd/cpamc-auto-switcher/main.go', () => {
+      expect(abbreviateEmail('a@b.com')).toBe('a@b.com');
+      expect(abbreviateEmail('user@test.org')).toBe('user@test.org');
+      expect(abbreviateEmail('abcdef@domain.com')).toBe('abcdef@domain.com');
+    });
+
+    it('abbreviates email with local part > 6 characters to first3...last3 preserving domain', () => {
+      expect(abbreviateEmail('abcdefg@domain.com')).toBe('abc...efg@domain.com');
+      expect(abbreviateEmail('antigravity.account@gmail.com')).toBe('ant...unt@gmail.com');
+      expect(abbreviateEmail('developer-john@corp.io')).toBe('dev...ohn@corp.io');
+    });
+
+    it('returns raw string if email lacks an at-sign', () => {
+      expect(abbreviateEmail('not_an_email')).toBe('not_an_email');
+      expect(abbreviateEmail('')).toBe('');
+    });
+
+    it('extracts and masks email safely when explicit email field is provided', () => {
+      expect(extractSafeMaskedEmail('admin.superdeveloper@cluster.local', 'auth.json')).toBe(
+        'adm...per@cluster.local'
+      );
+      expect(extractSafeMaskedEmail('simple@domain.com', 'auth.json')).toBe(
+        'simple@domain.com'
+      );
+    });
+
+    it('derives email from filename when email field is absent and filename contains an email pattern', () => {
+      const derived = extractSafeMaskedEmail('', 'antigravity-user.name@provider.org.json');
+      expect(derived).toBe('use...ame@provider.org');
+
+      const derivedPlus = extractSafeMaskedEmail(
+        null,
+        'codex-myaccount@domain.co-plus.json'
+      );
+      expect(derivedPlus).toBe('mya...unt@domain.co');
+    });
+
+    it('avoids displaying full filename as email when filename lacks an email pattern', () => {
+      expect(extractSafeMaskedEmail('', 'account-1.json')).toBe('');
+      expect(extractSafeMaskedEmail(undefined, 'agy_profile_prod.json')).toBe('');
+      expect(extractSafeMaskedEmail(null, 'default-auth.json')).toBe('');
+    });
+
+    it('propagates type, provider, and email safely through listAuthFiles', async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          files: [
+            {
+              name: 'f1.json',
+              type: 'antigravity',
+              provider: 'antigravity',
+              email: 'antigravity.corp@gmail.com',
+            },
+            {
+              name: 'f2.json',
+              type: '',
+              provider: 'codex',
+              email: 'short@codex.ai',
+            },
+          ],
+        }),
+      });
+
+      const files = await listAuthFiles({ key: 'test-key', fetchFn: mockFetch });
+      expect(files).toHaveLength(2);
+      expect(files[0]).toEqual({
+        name: 'f1.json',
+        id: 'f1.json',
+        type: 'antigravity',
+        provider: 'antigravity',
+        email: 'antigravity.corp@gmail.com',
+        status: '',
+      });
+      expect(files[1]).toEqual({
+        name: 'f2.json',
+        id: 'f2.json',
+        type: '',
+        provider: 'codex',
+        email: 'short@codex.ai',
+        status: '',
+      });
+    });
+
+    it('buildGraphFromAuthFiles applies type fallback provider and stores masked email only in node.data', () => {
+      const authFiles = [
+        {
+          name: 'account1.json',
+          prefix: 'agy_p1',
+          type: 'antigravity',
+          provider: 'google',
+          email: 'very.long.email.account@domain.org',
+        },
+        {
+          name: 'account2.json',
+          prefix: 'agy_p1_1',
+          type: '',
+          provider: 'codex', // fallback to provider
+          email: '', // will derive from filename if present or empty
+        },
+        {
+          name: 'developer.user@openai.com.json',
+          prefix: 'agy_p1_2',
+          type: '',
+          provider: '',
+          email: '', // derived from filename
+        },
+      ];
+
+      const { nodes, edges } = buildGraphFromAuthFiles(authFiles);
+      expect(nodes).toHaveLength(3);
+      expect(edges).toHaveLength(2);
+
+      // Node 1: explicit type wins over provider, masked email stored
+      const n1 = nodes[0];
+      expect(n1.data.accountType).toBe('antigravity');
+      expect(n1.data.maskedEmail).toBe('ver...unt@domain.org');
+      expect(n1.data.email).toBe('ver...unt@domain.org');
+      // Crucial: ensure raw full email is NEVER stored in node.data
+      expect(n1.data).not.toHaveProperty('rawEmail');
+      expect(JSON.stringify(n1.data)).not.toContain('very.long.email.account@domain.org');
+
+      // Node 2: type empty, falls back to provider ('codex')
+      const n2 = nodes[1];
+      expect(n2.data.accountType).toBe('codex');
+      expect(n2.data.maskedEmail).toBe('');
+
+      // Node 3: derived email from filename
+      const n3 = nodes[2];
+      expect(n3.data.maskedEmail).toBe('dev...ser@openai.com');
+      expect(n3.data.email).toBe('dev...ser@openai.com');
+      // fileName preserves physical filename, but email fields are masked
+      expect(n3.data.fileName).toBe('developer.user@openai.com.json');
+    });
+
+    describe('maskDisplayIdentifier Helper', () => {
+      it('masks embedded email in filename while preserving suffix and extension', () => {
+        expect(maskDisplayIdentifier('developer.user@openai.com.json')).toBe(
+          'dev...ser@openai.com.json'
+        );
+        expect(maskDisplayIdentifier('antigravity-user.name@provider.org.json')).toBe(
+          'antigravity-use...ame@provider.org.json'
+        );
+        expect(maskDisplayIdentifier('codex-myaccount@domain.co-plus.json')).toBe(
+          'codex-mya...unt@domain.co-plus.json'
+        );
+      });
+
+      it('leaves local parts <= 6 characters unchanged matching CPAMC convention', () => {
+        expect(maskDisplayIdentifier('short@openai.com.json')).toBe('short@openai.com.json');
+        expect(maskDisplayIdentifier('user@domain.com.json')).toBe('user@domain.com.json');
+      });
+
+      it('leaves non-email filenames unchanged', () => {
+        expect(maskDisplayIdentifier('account-1.json')).toBe('account-1.json');
+        expect(maskDisplayIdentifier('auth-root.json')).toBe('auth-root.json');
+        expect(maskDisplayIdentifier('my_profile_prod.json')).toBe('my_profile_prod.json');
+      });
+
+      it('safely handles empty, null, or undefined values', () => {
+        expect(maskDisplayIdentifier('')).toBe('');
+        expect(maskDisplayIdentifier(null)).toBe('');
+        expect(maskDisplayIdentifier(undefined)).toBe('');
+      });
+
+      it('masks embedded emails within error strings and candidate lists', () => {
+        const errorMsg =
+          'Cannot disconnect profile(s) [developer.user@openai.com.json] with attached descendants. Disconnect descendants first.';
+        expect(maskDisplayIdentifier(errorMsg)).toBe(
+          'Cannot disconnect profile(s) [dev...ser@openai.com.json] with attached descendants. Disconnect descendants first.'
+        );
+
+        const candidateList =
+          'Candidates: acc1.json, antigravity-user.name@provider.org.json';
+        expect(maskDisplayIdentifier(candidateList)).toBe(
+          'Candidates: acc1.json, antigravity-use...ame@provider.org.json'
+        );
+      });
+    });
   });
 });

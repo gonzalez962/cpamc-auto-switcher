@@ -383,6 +383,63 @@ body, html {
   border: 1px solid #db6d28;
 }
 
+.badge-account-type {
+  background-color: rgba(136, 88, 255, 0.2);
+  color: #bc8cff;
+  border: 1px solid rgba(136, 88, 255, 0.4);
+}
+
+.badge-type-antigravity {
+  background-color: rgba(187, 128, 255, 0.2);
+  color: #d2a8ff;
+  border: 1px solid rgba(187, 128, 255, 0.4);
+}
+
+.badge-type-codex {
+  background-color: rgba(56, 139, 253, 0.2);
+  color: #79c0ff;
+  border: 1px solid rgba(56, 139, 253, 0.4);
+}
+
+.profile-node-email {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-secondary);
+  margin-top: 2px;
+  margin-bottom: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profile-node-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.btn-disconnect-node {
+  background-color: rgba(248, 81, 73, 0.1);
+  border: 1px solid rgba(248, 81, 73, 0.4);
+  color: #f85149;
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 500;
+  transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.btn-disconnect-node:hover {
+  background-color: rgba(248, 81, 73, 0.25);
+  border-color: #f85149;
+  color: #ff7b72;
+}
+
+.graph-feedback-banner {
+  margin-bottom: 8px;
+}
+
 .profile-node-ambiguous-footer {
   border-top: 1px dashed rgba(219, 109, 40, 0.4);
 }

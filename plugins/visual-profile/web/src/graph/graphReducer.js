@@ -7,6 +7,9 @@ import {
   validateConnection,
   getNextAvailableRootPrefix,
   getNextAvailableChildPrefix,
+  partitionEdgeRemovals,
+  canDisconnectTarget,
+  maskDisplayIdentifier,
 } from './connection';
 
 /**
@@ -14,12 +17,14 @@ import {
  *
  * @param {Array<Object>} nodes
  * @param {Array<Object>} edges
- * @returns {{ nodes: Array<Object>, edges: Array<Object> }}
+ * @returns {{ nodes: Array<Object>, edges: Array<Object>, graphFeedback: string | null, lastRemoval: Object | null }}
  */
 export function createInitialGraphState(nodes = [], edges = []) {
   return {
     nodes: Array.isArray(nodes) ? nodes : [],
     edges: Array.isArray(edges) ? edges : [],
+    graphFeedback: null,
+    lastRemoval: null,
   };
 }
 
@@ -90,6 +95,109 @@ export function connectNodesAtomic(state, connection) {
 }
 
 /**
+ * Atomically disconnects edge(s) from target node(s).
+ * - Enforces descendant guard: target cannot be disconnected if it has attached outgoing edges (descendants).
+ * - For rejected removals, original state is preserved completely.
+ * - For accepted removals:
+ *   - Edge is removed.
+ *   - Target node prefix is set to empty string ''.
+ *   - Target node label is set to fileName || id.
+ *   - Target node isDirty is calculated against initialPrefix ('' !== initialPrefix).
+ *   - Target node isRoot is set to false.
+ *   - Target node ambiguousParent is cleared (null).
+ *
+ * @param {{ nodes: Array<Object>, edges: Array<Object> }} state
+ * @param {Array<string>|string} edgeIdsToRemove
+ * @returns {{ nodes: Array<Object>, edges: Array<Object> }}
+ */
+export function removeEdgesAtomic(state, edgeIdsToRemove) {
+  const edgeIds = Array.isArray(edgeIdsToRemove)
+    ? edgeIdsToRemove
+    : [edgeIdsToRemove].filter(Boolean);
+
+  if (!edgeIds.length) {
+    return state;
+  }
+
+  const { safeRemovals, rejectedRemovals } = partitionEdgeRemovals(
+    state.edges,
+    edgeIds
+  );
+
+  let feedback = null;
+  if (rejectedRemovals.length > 0) {
+    const names = rejectedRemovals
+      .map((r) => maskDisplayIdentifier(r.edge.target))
+      .join(', ');
+    feedback = `Cannot disconnect profile(s) [${names}] with attached descendants. Disconnect descendants first.`;
+  }
+
+  if (!safeRemovals.length) {
+    // All removals blocked by descendant guard: preserve original state and set feedback
+    return {
+      ...state,
+      graphFeedback: feedback,
+      lastRemoval: { safeRemovals: [], rejectedRemovals },
+    };
+  }
+
+  const safeEdgeIdSet = new Set(safeRemovals.map((e) => e.id));
+  const targetMap = new Map();
+  safeRemovals.forEach((e) => {
+    targetMap.set(e.target, e);
+  });
+
+  const nextEdges = state.edges.filter((e) => !e || !safeEdgeIdSet.has(e.id));
+
+  const nextNodes = state.nodes.map((node) => {
+    if (targetMap.has(node.id)) {
+      const initial =
+        node.data?.initialPrefix !== undefined ? node.data.initialPrefix : '';
+      const isDirty = '' !== initial;
+      const label = node.data?.fileName || node.id;
+      return {
+        ...node,
+        data: {
+          ...node.data,
+          prefix: '',
+          label,
+          isDirty,
+          isRoot: false,
+          ambiguousParent: null,
+        },
+      };
+    }
+    return node;
+  });
+
+  return {
+    ...state,
+    nodes: nextNodes,
+    edges: nextEdges,
+    graphFeedback: feedback,
+    lastRemoval: { safeRemovals, rejectedRemovals },
+  };
+}
+
+/**
+ * Atomically disconnects a child node from its incoming parent edge.
+ *
+ * @param {{ nodes: Array<Object>, edges: Array<Object> }} state
+ * @param {string} nodeId
+ * @returns {{ nodes: Array<Object>, edges: Array<Object> }}
+ */
+export function disconnectNodeAtomic(state, nodeId) {
+  if (!nodeId) return state;
+
+  const incomingEdge = state.edges.find((e) => e && e.target === nodeId);
+  if (!incomingEdge) {
+    return state;
+  }
+
+  return removeEdgesAtomic(state, [incomingEdge.id]);
+}
+
+/**
  * Predictable atomic graph reducer owning both nodes and edges.
  * Strictly pure: no side effects, no Date.now(), no mutable module state.
  * Fully idempotent under React StrictMode double-invocations.
@@ -101,7 +209,27 @@ export function connectNodesAtomic(state, connection) {
 export function graphReducer(state, action) {
   switch (action.type) {
     case 'CONNECT': {
-      return connectNodesAtomic(state, action.connection);
+      const nextState = connectNodesAtomic(state, action.connection);
+      if (nextState === state) {
+        return state;
+      }
+      return {
+        ...nextState,
+        graphFeedback: null,
+      };
+    }
+
+    case 'REMOVE_EDGES': {
+      return removeEdgesAtomic(state, action.edgeIds);
+    }
+
+    case 'REMOVE_EDGE': {
+      const id = action.id || action.edgeId;
+      return removeEdgesAtomic(state, [id]);
+    }
+
+    case 'DISCONNECT_NODE': {
+      return disconnectNodeAtomic(state, action.nodeId);
     }
 
     case 'UPDATE_NODE_PREFIX': {
@@ -167,6 +295,7 @@ export function graphReducer(state, action) {
         ...state,
         nodes: nextNodes,
         edges: nextEdges,
+        graphFeedback: null,
       };
     }
 
@@ -197,6 +326,7 @@ export function graphReducer(state, action) {
       return {
         ...state,
         nodes: [...state.nodes, newNode],
+        graphFeedback: null,
       };
     }
 
@@ -226,6 +356,7 @@ export function graphReducer(state, action) {
       return {
         ...state,
         nodes: [...state.nodes, newNode],
+        graphFeedback: null,
       };
     }
 
@@ -259,7 +390,24 @@ export function graphReducer(state, action) {
     }
 
     case 'RESET': {
-      return createInitialGraphState(action.nodes, action.edges);
+      return {
+        ...createInitialGraphState(action.nodes, action.edges),
+        graphFeedback: null,
+      };
+    }
+
+    case 'SET_GRAPH_FEEDBACK': {
+      return {
+        ...state,
+        graphFeedback: action.feedback || null,
+      };
+    }
+
+    case 'CLEAR_GRAPH_FEEDBACK': {
+      return {
+        ...state,
+        graphFeedback: null,
+      };
     }
 
     case 'RECONCILE_SAVED_NODES': {

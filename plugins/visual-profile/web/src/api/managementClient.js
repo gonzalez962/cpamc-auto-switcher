@@ -14,6 +14,88 @@
 
 const SECRET_SALT = 'cli-proxy-api-webui::secure-storage';
 const ENC_PREFIX = 'enc::v1::';
+const EMAIL_REGEX = /[a-zA-Z0-9._%+]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
+const SUFFIX_STRIP = /(?:-plus)?\.json$/i;
+
+/**
+ * Abbreviates an email address matching cmd/cpamc-auto-switcher/main.go:
+ * First 3 + '...' + last 3 of local part, preserving domain.
+ * If local part has <= 6 characters, returns original email unchanged.
+ * If email has no '@', returns original string.
+ *
+ * @param {string} email
+ * @returns {string} Masked/abbreviated email
+ */
+export function abbreviateEmail(email) {
+  if (!email || typeof email !== 'string') return '';
+  const trimmed = email.trim();
+  const atIdx = trimmed.lastIndexOf('@');
+  if (atIdx === -1) {
+    return trimmed;
+  }
+  const local = trimmed.slice(0, atIdx);
+  const domain = trimmed.slice(atIdx);
+  const runes = Array.from(local);
+  if (runes.length <= 6) {
+    return trimmed;
+  }
+  return runes.slice(0, 3).join('') + '...' + runes.slice(-3).join('') + domain;
+}
+
+/**
+ * Extracts and masks email safely from auth file metadata or filename.
+ *
+ * SAFETY INVARIANTS:
+ * - If email field is present, validates with EMAIL_REGEX and abbreviates.
+ * - If email field is absent, attempts to extract email pattern from filename (e.g. user@domain.com.json).
+ * - Avoids displaying full filename as email: if filename does NOT match an email pattern, returns empty string.
+ * - Raw email is NEVER returned or stored in node.data.
+ *
+ * @param {string} [email]
+ * @param {string} [fileName]
+ * @returns {string} Abbreviated email or empty string
+ */
+export function extractSafeMaskedEmail(email, fileName) {
+  if (email && typeof email === 'string') {
+    const cleanEmail = email.replace(SUFFIX_STRIP, '').trim();
+    const match = cleanEmail.match(EMAIL_REGEX);
+    if (match) {
+      return abbreviateEmail(match[0]);
+    }
+  }
+  if (fileName && typeof fileName === 'string') {
+    const cleanName = fileName.replace(SUFFIX_STRIP, '').trim();
+    const match = cleanName.match(EMAIL_REGEX);
+    if (match) {
+      return abbreviateEmail(match[0]);
+    }
+  }
+  return '';
+}
+
+/**
+ * Masks any email addresses embedded in a display identifier (such as a filename,
+ * node ID, candidate list, or error message) while preserving file extensions and
+ * surrounding non-email context.
+ *
+ * SAFETY & PRIVACY INVARIANTS:
+ * - Pure display helper: never mutates exact physical auth-file IDs or state payloads.
+ * - Matches embedded emails (e.g. user@domain.com) and abbreviates local parts > 6 chars
+ *   to first3...last3 preserving domain and suffix (e.g. dev...ser@openai.com.json).
+ * - Leaves local parts <= 6 chars unchanged per CLIProxyAPI masking convention.
+ * - Non-email strings and filenames are returned unchanged.
+ * - Safe against null, undefined, or non-string inputs.
+ *
+ * @param {string} identifier - Filename, ID, or text that may contain embedded emails
+ * @returns {string} Safe display string with embedded emails masked
+ */
+export function maskDisplayIdentifier(identifier) {
+  if (!identifier || typeof identifier !== 'string') return '';
+  return identifier.replace(
+    /[a-zA-Z0-9._%+]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g,
+    (match) => abbreviateEmail(match)
+  );
+}
 
 /**
  * Sanitizes a file name for safe display in error messages without leaking control characters or tokens.
@@ -354,6 +436,7 @@ export async function listAuthFiles(options = {}) {
       id: typeof file.id === 'string' && file.id.trim() ? file.id : exactName,
       type: typeof file.type === 'string' ? file.type.trim() : '',
       provider: typeof file.provider === 'string' ? file.provider.trim() : '',
+      email: typeof file.email === 'string' ? file.email.trim() : '',
       status: typeof file.status === 'string' ? file.status.trim() : '',
     });
   }
@@ -417,12 +500,17 @@ export async function loadAuthFilesWithPrefixes(options = {}) {
     files.map(async (file) => {
       try {
         const details = await downloadAuthFilePrefix(file.name, options);
-        return {
+        const record = {
           name: file.name,
           prefix: details.prefix,
         };
+        if (file.type) record.type = file.type;
+        if (file.provider) record.provider = file.provider;
+        if (file.email) record.email = file.email;
+        if (file.status) record.status = file.status;
+        return record;
       } catch (err) {
-        const safeName = sanitizeFileName(file.name);
+        const safeName = maskDisplayIdentifier(sanitizeFileName(file.name));
         let statusText = 'request failed';
         if (err.message && err.message.includes('401')) {
           statusText = '401 Unauthorized';
@@ -472,6 +560,10 @@ export function buildGraphFromAuthFiles(authFiles = []) {
       cleanFiles.push({
         name: file.name,
         prefix: typeof file.prefix === 'string' ? file.prefix.trim() : '',
+        type: typeof file.type === 'string' ? file.type.trim() : '',
+        provider: typeof file.provider === 'string' ? file.provider.trim() : '',
+        email: typeof file.email === 'string' ? file.email.trim() : '',
+        status: typeof file.status === 'string' ? file.status.trim() : '',
       });
     }
   });
@@ -537,6 +629,8 @@ export function buildGraphFromAuthFiles(authFiles = []) {
     const isChild = childNodeIds.has(fileName);
     const isRoot = !isChild && Boolean(prefix);
     const ambiguousParent = ambiguousChildMap.get(fileName) || null;
+    const accountType = (file.type || file.provider || '').trim().toLowerCase();
+    const maskedEmail = extractSafeMaskedEmail(file.email, fileName);
 
     // Layout in grid: roots on top rows, children on lower rows
     const col = idx % 4;
@@ -559,6 +653,10 @@ export function buildGraphFromAuthFiles(authFiles = []) {
         isRoot,
         isSynthetic: false, // Real auth-file node
         ambiguousParent,
+        accountType,
+        provider: (file.provider || file.type || '').trim().toLowerCase(),
+        maskedEmail, // Store masked email only in node.data
+        email: maskedEmail, // Raw email is NEVER stored
       },
     };
   });
@@ -643,7 +741,7 @@ export async function patchAuthFilePrefix(fileName, prefix, options = {}) {
       status: res.status,
     };
   } catch (err) {
-    const safeName = sanitizeFileName(exactName);
+    const safeName = maskDisplayIdentifier(sanitizeFileName(exactName));
     const rawMsg = err.message || '';
 
     if (rawMsg.includes('401')) {

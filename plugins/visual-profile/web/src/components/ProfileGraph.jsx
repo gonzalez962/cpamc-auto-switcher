@@ -20,7 +20,12 @@ import {
 import '@xyflow/react/dist/style.css';
 
 import ProfileNode from './ProfileNode';
-import { countOutgoingEdges } from '../graph/connection';
+import {
+  countOutgoingEdges,
+  canDisconnectTarget,
+  partitionEdgeRemovals,
+  maskDisplayIdentifier,
+} from '../graph/connection';
 import { graphReducer } from '../graph/graphReducer';
 import { saveAuthFilePrefixes } from '../api/managementClient';
 
@@ -61,13 +66,22 @@ const initialEdgesData = [];
 // Normalize nodes ensuring each has valid position coordinates
 function sanitizeNodes(nodes) {
   if (!Array.isArray(nodes)) return [];
-  return nodes.map((n, idx) => ({
-    ...n,
-    position:
-      n.position && typeof n.position.x === 'number' && typeof n.position.y === 'number'
-        ? n.position
-        : { x: 100 + (idx % 4) * 160, y: 80 + Math.floor(idx / 4) * 140 },
-  }));
+  return nodes.map((n, idx) => {
+    const currentPrefix = n.data?.prefix !== undefined ? n.data.prefix : '';
+    const initialPrefix =
+      n.data?.initialPrefix !== undefined ? n.data.initialPrefix : currentPrefix;
+    return {
+      ...n,
+      position:
+        n.position && typeof n.position.x === 'number' && typeof n.position.y === 'number'
+          ? n.position
+          : { x: 100 + (idx % 4) * 160, y: 80 + Math.floor(idx / 4) * 140 },
+      data: {
+        ...n.data,
+        initialPrefix,
+      },
+    };
+  });
 }
 
 /**
@@ -112,6 +126,8 @@ const ProfileGraph = forwardRef(function ProfileGraph(
   const [graphState, dispatch] = useReducer(graphReducer, {
     nodes: safeInitialNodes,
     edges: safeInitialEdges,
+    graphFeedback: null,
+    lastRemoval: null,
   });
 
   const { nodes, edges } = graphState;
@@ -119,6 +135,16 @@ const ProfileGraph = forwardRef(function ProfileGraph(
   // Keep synchronous ref to freshest graph state for async baseline synchronization
   const graphStateRef = useRef(graphState);
   graphStateRef.current = graphState;
+
+  // Graph action feedback banner derived directly from pure reducer state
+  const graphFeedback = graphState.graphFeedback || null;
+  const setGraphFeedback = useCallback((feedback) => {
+    if (feedback) {
+      dispatch({ type: 'SET_GRAPH_FEEDBACK', feedback });
+    } else {
+      dispatch({ type: 'CLEAR_GRAPH_FEEDBACK' });
+    }
+  }, []);
 
   // Save changes state and overlap guard
   const [isSaving, setIsSaving] = useState(false);
@@ -169,12 +195,30 @@ const ProfileGraph = forwardRef(function ProfileGraph(
     [setNodes]
   );
 
-  // React Flow edge changes adapter
+  // React Flow edge changes adapter with descendant guard on removals
   const onEdgesChange = useCallback(
     (changes) => {
-      setEdges((eds) => applyEdgeChanges(changes, eds));
+      if (!Array.isArray(changes) || changes.length === 0) return;
+
+      const removeChanges = changes.filter((c) => c && c.type === 'remove');
+      const otherChanges = changes.filter((c) => !c || c.type !== 'remove');
+
+      if (otherChanges.length > 0) {
+        setEdges((eds) => applyEdgeChanges(otherChanges, eds));
+      }
+
+      if (removeChanges.length > 0) {
+        const edgeIdsToRemove = removeChanges.map((c) => c.id);
+        dispatch({
+          type: 'REMOVE_EDGES',
+          edgeIds: edgeIdsToRemove,
+        });
+        if (typeof onGraphChange === 'function') {
+          onGraphChange();
+        }
+      }
     },
-    [setEdges]
+    [onGraphChange, setEdges]
   );
 
   // Atomic onConnect callback
@@ -189,6 +233,18 @@ const ProfileGraph = forwardRef(function ProfileGraph(
       }
     },
     [externalOnConnect, onGraphChange]
+  );
+
+  // Atomic child node disconnect handler enforcing descendant guard via reducer snapshot
+  const handleDisconnectNode = useCallback(
+    (nodeId) => {
+      dispatch({ type: 'DISCONNECT_NODE', nodeId });
+      if (typeof onGraphChange === 'function') {
+        onGraphChange();
+      }
+      return { success: true };
+    },
+    [onGraphChange]
   );
 
   // Atomic inline prefix change callback with validation feedback
@@ -282,6 +338,9 @@ const ProfileGraph = forwardRef(function ProfileGraph(
       };
     });
 
+    // Capture state snapshot before save begins to track pre-save topology
+    const preSaveEdges = [...(graphStateRef.current?.edges || edges)];
+
     isSavingRef.current = true;
     setIsSaving(true);
     setSaveState({
@@ -308,36 +367,79 @@ const ProfileGraph = forwardRef(function ProfileGraph(
 
       // Update baseline nodes with newly saved prefixes to prevent Reset from reverting to stale initial props.
       // Must be built from freshest graph state (graphStateRef.current), not stale closure values,
-      // preserving in-flight edge changes and latest draft edits.
+      // preserving in-flight edge changes and latest draft edits while maintaining prefix/edge coherence.
       if (successful.length > 0) {
         const savedMap = new Map();
         successful.forEach((item) => {
           if (item && item.name) {
-            savedMap.set(item.name, item.prefix || '');
+            savedMap.set(item.name, item.prefix !== undefined ? String(item.prefix).trim() : '');
           }
         });
 
         const latestState = graphStateRef.current || { nodes, edges };
-        currentBaselineRef.current = {
-          nodes: latestState.nodes.map((node) => {
-            const fileKey = node.data?.fileName || node.id;
-            if (savedMap.has(fileKey)) {
-              const newPrefix = savedMap.get(fileKey);
-              return {
-                ...node,
-                data: {
-                  ...node.data,
-                  prefix: newPrefix,
-                  initialPrefix: newPrefix,
-                  label: newPrefix || node.data?.fileName || node.id,
-                  isDirty: false,
-                },
-              };
+
+        // 1. Construct baseline nodes with reconciled server-saved prefixes
+        const baselineNodes = latestState.nodes.map((node) => {
+          const fileKey = node.data?.fileName || node.id;
+          if (savedMap.has(fileKey)) {
+            const newPrefix = savedMap.get(fileKey);
+            return {
+              ...node,
+              data: {
+                ...node.data,
+                prefix: newPrefix,
+                initialPrefix: newPrefix,
+                label: newPrefix || node.data?.fileName || node.id,
+                isDirty: false,
+              },
+            };
+          }
+          return node;
+        });
+
+        // 2. Construct baseline edges:
+        // Start with freshest edges from latestState.edges (preserving in-flight connections).
+        const baselineEdgesMap = new Map();
+        latestState.edges.forEach((e) => {
+          if (e && e.id) {
+            baselineEdgesMap.set(e.id, e);
+          }
+        });
+
+        // Ensure prefix/edge coherence for nodes successfully saved with a non-empty prefix:
+        // If a node was saved to the server with a non-empty child prefix (e.g. 'agy_p1_1')
+        // but was draft-disconnected while the async save was pending (so its edge is missing
+        // in latestState.edges), restore its pre-save incoming edge in the baseline.
+        // This guarantees that Reset restores the coherent server-saved state (both prefix AND edge)
+        // without leaving orphan child nodes with child prefixes.
+        successful.forEach((item) => {
+          const fileKey = item?.name;
+          const savedPrefix = item?.prefix !== undefined ? String(item.prefix).trim() : '';
+          if (savedPrefix !== '') {
+            const preEdge = preSaveEdges.find(
+              (e) => e && (e.target === fileKey || e.target === item.id)
+            );
+            if (preEdge) {
+              const hasIncoming = Array.from(baselineEdgesMap.values()).some(
+                (e) => e && (e.target === fileKey || e.target === item.id)
+              );
+              if (!hasIncoming) {
+                const sourceNode = baselineNodes.find(
+                  (n) => n && (n.id === preEdge.source || n.data?.fileName === preEdge.source)
+                );
+                const sourcePrefix = sourceNode?.data?.prefix || '';
+                // Deterministic coherence check: only restore edge if source prefix matches child prefix pattern
+                if (sourcePrefix && savedPrefix.startsWith(`${sourcePrefix}_`)) {
+                  baselineEdgesMap.set(preEdge.id, preEdge);
+                }
+              }
             }
-            return node;
-          }),
-          // FRESHEST edges, preserving in-flight edge connections/disconnections during the async save
-          edges: [...latestState.edges],
+          }
+        });
+
+        currentBaselineRef.current = {
+          nodes: baselineNodes,
+          edges: Array.from(baselineEdgesMap.values()),
         };
       }
 
@@ -441,6 +543,19 @@ const ProfileGraph = forwardRef(function ProfileGraph(
       connect: (conn) => onConnect(conn),
       onConnect,
       updateNodePrefix: (id, prefix) => handleNodePrefixChange(id, prefix),
+      disconnectNode: (id) => handleDisconnectNode(id),
+      removeEdges: (edgeIds) => {
+        const edgeList = Array.isArray(edgeIds) ? edgeIds : [edgeIds].filter(Boolean);
+        dispatch({
+          type: 'REMOVE_EDGES',
+          edgeIds: edgeList,
+        });
+        if (typeof onGraphChange === 'function') {
+          onGraphChange();
+        }
+        const currentEdges = graphStateRef.current?.edges || [];
+        return partitionEdgeRemovals(currentEdges, edgeList);
+      },
       getNodes: () => nodes,
       getEdges: () => edges,
       isDirty: () => nodes.some((n) => Boolean(n.data?.isDirty)),
@@ -471,6 +586,7 @@ const ProfileGraph = forwardRef(function ProfileGraph(
     [
       onConnect,
       handleNodePrefixChange,
+      handleDisconnectNode,
       handleSaveChanges,
       isSaving,
       saveState,
@@ -510,20 +626,23 @@ const ProfileGraph = forwardRef(function ProfileGraph(
     });
   }, [generateId]);
 
-  // Derive outgoingCount and attach atomic onPrefixChange to all nodes
+  // Derive outgoingCount and attach atomic callbacks to all nodes
   const displayNodes = useMemo(() => {
     return nodes.map((node) => {
       const derivedCount = countOutgoingEdges(edges, node.id);
+      const incomingEdge = edges.find((e) => e && e.target === node.id);
       return {
         ...node,
         data: {
           ...node.data,
           outgoingCount: derivedCount,
+          hasParent: Boolean(incomingEdge),
           onPrefixChange: handleNodePrefixChange,
+          onDisconnect: handleDisconnectNode,
         },
       };
     });
-  }, [nodes, edges, handleNodePrefixChange]);
+  }, [nodes, edges, handleNodePrefixChange, handleDisconnectNode]);
 
   // Derived metrics for UI status bar
   const rootCount = useMemo(() => nodes.filter((n) => n.data?.isRoot).length, [nodes]);
@@ -653,8 +772,8 @@ const ProfileGraph = forwardRef(function ProfileGraph(
             {saveState.failed && saveState.failed.length > 0 && (
               <ul className="save-status-failures">
                 {saveState.failed.map((f, i) => (
-                  <li key={i} data-testid={`save-failure-${f.name}`}>
-                    <code>{f.name}</code>: {f.error}
+                  <li key={i} data-testid={`save-failure-${maskDisplayIdentifier(f.name)}`}>
+                    <code>{maskDisplayIdentifier(f.name)}</code>: {maskDisplayIdentifier(f.error)}
                   </li>
                 ))}
               </ul>
@@ -682,6 +801,29 @@ const ProfileGraph = forwardRef(function ProfileGraph(
                 ✕
               </button>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Graph Action Feedback Banner (e.g. Descendant Guard block) */}
+      {graphFeedback && (
+        <div
+          className="save-status-banner save-status-error graph-feedback-banner"
+          data-testid="graph-feedback-banner"
+        >
+          <div className="save-status-content">
+            <span className="save-status-message">{maskDisplayIdentifier(graphFeedback)}</span>
+          </div>
+          <div className="save-status-actions">
+            <button
+              type="button"
+              className="btn-dismiss-banner"
+              onClick={() => setGraphFeedback(null)}
+              data-testid="btn-dismiss-graph-feedback"
+              aria-label="Dismiss feedback"
+            >
+              ✕
+            </button>
           </div>
         </div>
       )}
