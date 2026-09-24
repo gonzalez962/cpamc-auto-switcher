@@ -88,16 +88,26 @@ cd plugins/visual-profile
 go test ./...
 ```
 
-### C-Shared Library Build (CGO required)
+### Build the Linux AMD64 plugin with Docker
 
-To compile the C-ABI shared library for CLIProxyAPI, CGO must be enabled and an appropriate GCC toolchain installed:
+Run one of these single-line commands **from `plugins/visual-profile`**. Both build a Linux `.so` for CLIProxyAPI, including when Docker runs on Windows. The embedded UI comes from `internal/web/assets`; after changing the frontend, run `npm run build` in `web/` first.
+
+**Linux (Bash):**
 
 ```bash
-cd plugins/visual-profile
-
-# Linux AMD64 build (native on Linux or via cross-compiler)
-CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -buildmode=c-shared -o visual-profile-linux-amd64.so .
-
-# Windows AMD64 build (with MinGW-w64 gcc)
-CGO_ENABLED=1 GOOS=windows GOARCH=amd64 go build -buildmode=c-shared -o visual-profile-windows-amd64.dll .
+docker run --rm --platform linux/amd64 -v "$(pwd):/src" -w /src golang:1.22 go build -buildmode=c-shared -ldflags="-s -w" -o visual-profile-linux-amd64.so .
 ```
+
+**Windows (PowerShell):**
+
+```powershell
+docker run --rm --platform linux/amd64 -v "${PWD}:/src" -w /src golang:1.22 go build -buildmode=c-shared '-ldflags=-s -w' -o visual-profile-linux-amd64.so .
+```
+
+**Windows (Git Bash):**
+
+```bash
+MSYS_NO_PATHCONV=1 docker run --rm --platform linux/amd64 -v "$(pwd -W):/src" -w /src golang:1.22 go build -buildmode=c-shared '-ldflags=-s -w' -o visual-profile-linux-amd64.so .
+```
+
+The resulting file is `plugins/visual-profile/visual-profile-linux-amd64.so` (Go also generates a `.h` file). Docker must be running; the build uses the Linux CGO toolchain inside the image, not a local Windows compiler. Git Bash requires `MSYS_NO_PATHCONV=1` to keep Docker's `/src` path from being rewritten as a Windows path.

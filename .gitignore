@@ -2,3 +2,5 @@
 .atl/
 *.exe
 /odd
+*.so
+*.h
