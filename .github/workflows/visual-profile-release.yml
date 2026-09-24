@@ -1,0 +1,381 @@
+name: Release Linux Visual Profile Plugin
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'New release version tag (e.g. v0.1.0, must strictly match vX.Y.Z)'
+        required: true
+        type: string
+
+concurrency:
+  group: visual-profile-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and Validate Linux Plugin
+    runs-on: ubuntu-latest
+    if: github.repository == 'gonzalez962/cpamc-auto-switcher' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.validate.outputs.tag }}
+      version: ${{ steps.validate.outputs.version }}
+      commit_sha: ${{ steps.validate.outputs.commit_sha }}
+    steps:
+      - name: Verify repository, branch, and tag input format
+        env:
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "${REPO}" != "gonzalez962/cpamc-auto-switcher" ]; then
+            echo "::error::Unauthorized repository: ${REPO}. Workflow only allowed on gonzalez962/cpamc-auto-switcher."
+            exit 1
+          fi
+          if [ "${REF}" != "refs/heads/main" ]; then
+            echo "::error::Invalid branch: ${REF}. Manual workflow_dispatch must run from refs/heads/main."
+            exit 1
+          fi
+          if [[ ! "${INPUT_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag input '${INPUT_TAG}' does not match expected format vX.Y.Z (e.g. v0.1.0)"
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag, pin commit to main, check parity and collisions
+        id: validate
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          TAG="${INPUT_TAG}"
+
+          # 1. Validate tag format strictly matching vX.Y.Z
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag input '${TAG}' does not match expected format vX.Y.Z (e.g. v0.1.0)"
+            exit 1
+          fi
+
+          VERSION="${TAG#v}"
+
+          # 2. Pin checked-out commit SHA and verify alignment with workflow_dispatch SHA on main
+          COMMIT_SHA=$(git rev-parse HEAD)
+          if [ -n "${DISPATCH_SHA}" ] && [ "${COMMIT_SHA}" != "${DISPATCH_SHA}" ]; then
+            echo "::error::Checked-out SHA ${COMMIT_SHA} does not match dispatch SHA ${DISPATCH_SHA}."
+            exit 1
+          fi
+
+          # Verify checked-out commit is contained in origin/main before any mutation
+          git fetch origin +refs/heads/main:refs/remotes/origin/main
+          MAIN_COMMIT=$(git rev-parse --verify refs/remotes/origin/main)
+          if ! git merge-base --is-ancestor "${COMMIT_SHA}" "${MAIN_COMMIT}"; then
+            echo "::error::Commit ${COMMIT_SHA} is not an ancestor of origin/main (${MAIN_COMMIT})."
+            exit 1
+          fi
+
+          # 3. Check for existing remote tag collision (fail-closed)
+          set +e
+          TAG_CHECK_OUTPUT=$(git ls-remote --exit-code origin "refs/tags/${TAG}" "refs/tags/${TAG}^{}" 2>&1)
+          TAG_CHECK_EXIT=$?
+          set -e
+
+          if [ ${TAG_CHECK_EXIT} -eq 0 ]; then
+            echo "::error::Git tag '${TAG}' already exists on remote origin. Release workflow requires a new version tag."
+            exit 1
+          elif [ ${TAG_CHECK_EXIT} -eq 2 ]; then
+            echo "Verified remote tag '${TAG}' does not exist (clean)."
+          else
+            echo "::error::Failed to check remote tag '${TAG}' (fail-closed, exit ${TAG_CHECK_EXIT}): ${TAG_CHECK_OUTPUT}"
+            exit 1
+          fi
+
+          # 4. Check for existing GitHub Release collision (no-clobber, fail-closed)
+          set +e
+          RELEASE_API_OUTPUT=$(gh api "repos/${REPO}/releases/tags/${TAG}" 2>&1)
+          API_EXIT=$?
+          set -e
+
+          if [ ${API_EXIT} -eq 0 ]; then
+            echo "::error::GitHub Release '${TAG}' already exists. Release workflow requires a new version tag."
+            exit 1
+          elif echo "${RELEASE_API_OUTPUT}" | grep -q -E '\(HTTP 404\)'; then
+            echo "Verified release '${TAG}' does not exist (404 Not Found)."
+          else
+            echo "::error::GitHub release check failed unexpectedly (fail-closed): ${RELEASE_API_OUTPUT}"
+            exit 1
+          fi
+
+          # 5. Check internal Go plugin version
+          GO_VERSION=$(grep -E 'const Version = "[^"]+"' plugins/visual-profile/internal/version/version.go | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "${GO_VERSION}" != "${VERSION}" ]; then
+            echo "::error::Version mismatch: tag specifies '${VERSION}', but plugins/visual-profile/internal/version/version.go specifies '${GO_VERSION}'"
+            exit 1
+          fi
+
+          # 6. Check web package.json version
+          WEB_VERSION=$(node -p "require('./plugins/visual-profile/web/package.json').version" 2>/dev/null || grep -E '"version":' plugins/visual-profile/web/package.json | head -n 1 | sed -E 's/.*"version": "([^"]+)".*/\1/')
+          if [ "${WEB_VERSION}" != "${VERSION}" ]; then
+            echo "::error::Version mismatch: tag specifies '${VERSION}', but plugins/visual-profile/web/package.json specifies '${WEB_VERSION}'"
+            exit 1
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Validation succeeded for new tag ${TAG} (version ${VERSION}) at commit ${COMMIT_SHA}"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: plugins/visual-profile/web/package-lock.json
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false
+
+      - name: Install web dependencies
+        working-directory: plugins/visual-profile/web
+        run: npm ci
+
+      - name: Run web tests
+        working-directory: plugins/visual-profile/web
+        run: npm test -- --run
+
+      - name: Build web assets
+        working-directory: plugins/visual-profile/web
+        run: npm run build
+
+      - name: Verify committed web assets match generated UI
+        run: git diff --exit-code -- plugins/visual-profile/internal/web/assets/index.html
+
+      - name: Run Go tests
+        working-directory: plugins/visual-profile
+        run: go test -v ./...
+
+      - name: Build Linux amd64 shared library
+        working-directory: plugins/visual-profile
+        env:
+          CGO_ENABLED: '1'
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          go build -buildmode=c-shared -ldflags="-s -w" -o visual-profile-linux-amd64.so .
+          test -f visual-profile-linux-amd64.so
+
+      - name: Install arm64 cross-compilation toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+
+      - name: Build Linux arm64 shared library
+        working-directory: plugins/visual-profile
+        env:
+          CGO_ENABLED: '1'
+          GOOS: linux
+          GOARCH: arm64
+          CC: aarch64-linux-gnu-gcc
+        run: |
+          go build -buildmode=c-shared -ldflags="-s -w" -o visual-profile-linux-arm64.so .
+          test -f visual-profile-linux-arm64.so
+
+      - name: Verify ELF binary architecture and glibc linkage
+        working-directory: plugins/visual-profile
+        run: |
+          set -euo pipefail
+
+          echo "=== Inspecting Linux amd64 binary ==="
+          test -f visual-profile-linux-amd64.so
+          file visual-profile-linux-amd64.so
+          readelf -h visual-profile-linux-amd64.so
+          readelf -h visual-profile-linux-amd64.so | grep -q "ELF64"
+          readelf -h visual-profile-linux-amd64.so | grep -q -E "Advanced Micro Devices X86-64|x86-64"
+          readelf -d visual-profile-linux-amd64.so | grep -q -E "NEEDED.*libc\.so\.6"
+
+          echo "=== Inspecting Linux arm64 binary ==="
+          test -f visual-profile-linux-arm64.so
+          file visual-profile-linux-arm64.so
+          readelf -h visual-profile-linux-arm64.so
+          readelf -h visual-profile-linux-arm64.so | grep -q "ELF64"
+          readelf -h visual-profile-linux-arm64.so | grep -q -E "AArch64|aarch64"
+          readelf -d visual-profile-linux-arm64.so | grep -q -E "NEEDED.*libc\.so\.6"
+
+          # Confirm neither binary links against musl
+          if readelf -d visual-profile-linux-amd64.so | grep -iq "musl"; then
+            echo "::error::amd64 binary appears to link against musl instead of glibc"
+            exit 1
+          fi
+          if readelf -d visual-profile-linux-arm64.so | grep -iq "musl"; then
+            echo "::error::arm64 binary appears to link against musl instead of glibc"
+            exit 1
+          fi
+
+          echo "ELF architecture and glibc verification succeeded for both amd64 and arm64."
+
+      - name: Upload Linux amd64 binary artifact (.so only)
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-profile-linux-amd64
+          path: plugins/visual-profile/visual-profile-linux-amd64.so
+          if-no-files-found: error
+
+      - name: Upload Linux arm64 binary artifact (.so only)
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-profile-linux-arm64
+          path: plugins/visual-profile/visual-profile-linux-arm64.so
+          if-no-files-found: error
+
+  publish:
+    name: Publish Release to GitHub
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: github.repository == 'gonzalez962/cpamc-auto-switcher'
+    steps:
+      - name: Verify repository authorization
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "${REPO}" != "gonzalez962/cpamc-auto-switcher" ]; then
+            echo "::error::Unauthorized repository: ${REPO}. Workflow only allowed on gonzalez962/cpamc-auto-switcher."
+            exit 1
+          fi
+
+      - name: Checkout repository at verified commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build.outputs.commit_sha }}
+          fetch-depth: 0
+
+      - name: Download Linux amd64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: visual-profile-linux-amd64
+          path: release-assets
+
+      - name: Download Linux arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: visual-profile-linux-arm64
+          path: release-assets
+
+      - name: Generate SHA256 checksums
+        working-directory: release-assets
+        run: |
+          set -euo pipefail
+          test -f visual-profile-linux-amd64.so
+          test -f visual-profile-linux-arm64.so
+          sha256sum visual-profile-linux-amd64.so > visual-profile-linux-amd64.so.sha256
+          sha256sum visual-profile-linux-arm64.so > visual-profile-linux-arm64.so.sha256
+          echo "SHA256 checksums:"
+          cat visual-profile-linux-amd64.so.sha256
+          cat visual-profile-linux-arm64.so.sha256
+
+      - name: Recheck collisions and create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+          TARGET_COMMIT: ${{ needs.build.outputs.commit_sha }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # 1. Recheck tag collision: ensure remote tag still does not exist (fail-closed)
+          set +e
+          TAG_CHECK_OUTPUT=$(git ls-remote --exit-code origin "refs/tags/${RELEASE_TAG}" "refs/tags/${RELEASE_TAG}^{}" 2>&1)
+          TAG_CHECK_EXIT=$?
+          set -e
+
+          if [ ${TAG_CHECK_EXIT} -eq 0 ]; then
+            echo "::error::Git tag '${RELEASE_TAG}' already exists on remote origin: ${TAG_CHECK_OUTPUT}"
+            exit 1
+          elif [ ${TAG_CHECK_EXIT} -eq 2 ]; then
+            echo "Verified remote tag '${RELEASE_TAG}' does not exist (clean)."
+          else
+            echo "::error::Failed to check remote tag '${RELEASE_TAG}' (fail-closed, exit ${TAG_CHECK_EXIT}): ${TAG_CHECK_OUTPUT}"
+            exit 1
+          fi
+
+          # 2. Recheck release collision: ensure GitHub Release still does not exist (no-clobber, fail-closed)
+          set +e
+          RELEASE_API_OUTPUT=$(gh api "repos/${REPO}/releases/tags/${RELEASE_TAG}" 2>&1)
+          API_EXIT=$?
+          set -e
+
+          if [ ${API_EXIT} -eq 0 ]; then
+            echo "::error::GitHub Release '${RELEASE_TAG}' already exists."
+            exit 1
+          elif echo "${RELEASE_API_OUTPUT}" | grep -q -E '\(HTTP 404\)'; then
+            echo "Verified release '${RELEASE_TAG}' does not exist (404 Not Found)."
+          else
+            echo "::error::GitHub release check failed unexpectedly (fail-closed): ${RELEASE_API_OUTPUT}"
+            exit 1
+          fi
+
+          # 3. Check origin/main still contains target commit
+          git fetch origin +refs/heads/main:refs/remotes/origin/main
+          MAIN_COMMIT=$(git rev-parse --verify refs/remotes/origin/main)
+          if ! git merge-base --is-ancestor "${TARGET_COMMIT}" "${MAIN_COMMIT}"; then
+            echo "::error::Target commit ${TARGET_COMMIT} is not an ancestor of origin/main (${MAIN_COMMIT})."
+            exit 1
+          fi
+          echo "Verified target commit ${TARGET_COMMIT} is contained in origin/main (${MAIN_COMMIT})."
+
+          # 4. Generate release notes
+          {
+            printf '## Visual Profile Plugin %s\n\n' "${RELEASE_TAG}"
+            printf 'Pre-built Linux amd64 and arm64 (glibc) shared libraries for CLIProxyAPI `visual-profile` plugin.\n\n'
+            printf '### Artifacts\n'
+            printf -- '- `visual-profile-linux-amd64.so`: Linux amd64 shared library plugin (`-buildmode=c-shared`)\n'
+            printf -- '- `visual-profile-linux-amd64.so.sha256`: SHA-256 checksum for amd64 binary\n'
+            printf -- '- `visual-profile-linux-arm64.so`: Linux arm64 (glibc) shared library plugin (`-buildmode=c-shared`)\n'
+            printf -- '- `visual-profile-linux-arm64.so.sha256`: SHA-256 checksum for arm64 binary\n\n'
+            printf '### Supported Architectures & Environments\n'
+            printf -- '- **Linux amd64**: Standard x86_64 Linux distributions with glibc (Debian, Ubuntu, RHEL, CentOS, Fedora)\n'
+            printf -- '- **Linux arm64**: ARM64 / AArch64 Linux distributions with glibc (Raspberry Pi OS 64-bit, AWS Graviton, Apple Silicon Docker Linux containers). *Note: Linux/glibc only; native macOS host runtime is not supported.*\n\n'
+            printf '### Build Provenance\n'
+            printf -- '- **Commit**: `%s`\n' "${TARGET_COMMIT}"
+            printf -- '- **Tag**: `%s` (created by release workflow)\n' "${RELEASE_TAG}"
+            printf -- '- **Branch**: `main`\n'
+            printf -- '- **Go Version**: 1.22\n'
+            printf -- '- **Node Version**: 20\n\n'
+            printf '### Verification\n'
+            printf '```bash\n'
+            printf '# For Linux amd64:\n'
+            printf 'sha256sum -c visual-profile-linux-amd64.so.sha256\n\n'
+            printf '# For Linux arm64:\n'
+            printf 'sha256sum -c visual-profile-linux-arm64.so.sha256\n'
+            printf '```\n'
+          } > release-notes.md
+
+          # 5. Create release and upload binaries + checksums using GitHub CLI
+          # Note: --verify-tag is intentionally omitted so gh creates the tag at --target commit
+          gh release create "${RELEASE_TAG}" \
+            release-assets/visual-profile-linux-amd64.so \
+            release-assets/visual-profile-linux-amd64.so.sha256 \
+            release-assets/visual-profile-linux-arm64.so \
+            release-assets/visual-profile-linux-arm64.so.sha256 \
+            --target "${TARGET_COMMIT}" \
+            --title "Visual Profile Plugin ${RELEASE_TAG}" \
+            --notes-file release-notes.md
