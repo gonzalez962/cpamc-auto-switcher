@@ -11,6 +11,7 @@ import {
   canDisconnectTarget,
   maskDisplayIdentifier,
 } from './connection';
+import { computeGraphLayout } from './layout';
 
 /**
  * Creates an initial graph state containing nodes and edges.
@@ -467,6 +468,14 @@ export function graphReducer(state, action) {
         return node;
       });
 
+      return {
+        ...state,
+        nodes: nextNodes,
+      };
+    }
+
+    case 'AUTO_ARRANGE': {
+      const nextNodes = computeGraphLayout(state.nodes, state.edges, action.config);
       return {
         ...state,
         nodes: nextNodes,

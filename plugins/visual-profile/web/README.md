@@ -131,6 +131,28 @@ Interactive React Flow prefix topology editor for CLIProxyAPI parent/child accou
   - *Library constraint note*: React Flow internally attaches a `data-id="<nodeId>"` attribute to its outer canvas wrapper div elements outside component control; while this library-managed DOM attribute cannot be modified without breaking React Flow's internal reconciliation, all application-generated DOM elements, attributes (`data-testid`, `title`, labels, error text), and tooltips are strictly masked.
   - Raw downloaded credential secrets, tokens, private keys, and unmasked emails are never stored, logged, or exposed in accessible DOM tooltips (`title`), error banners, or `data-testid` attributes; only the masked email is stored in `node.data`.
 
+## Topology-Aware Deterministic Layout & Bounded Card Geometry (VP-8)
+
+- **Deterministic Hierarchy-Aware Initial Layout (`computeGraphLayout`)**:
+  - Replaces global array index positioning (`idx % 4`, `idx / 4`) which previously caused root/child collision when children preceded roots in auth-file listings.
+  - Recursively structures each connected component (tree/DAG) placing root profiles strictly above their descendants (`y(descendant) >= y(root) + LEVEL_PITCH`).
+  - Supports arbitrary multi-level nested chains (`Root -> Child -> Grandchild -> ...`) with guaranteed vertical separation.
+  - Leaf siblings are arranged in a single row under their parent (up to 5 siblings, <= 1440px) to eliminate upper-card edge crossings where feasible without infinite horizontal spreading; when sibling count exceeds horizontal capacity (> 5), they wrap into compact grid rows with full vertical clearance.
+  - Distinct component trees wrap onto subsequent rows when exceeding configured max canvas row width (`MAX_ROW_WIDTH: 1200px`).
+  - **Honest Edge Routing & Collision Invariant**: The layout engine guarantees zero bounding-box node collisions. Standard React Flow straight or bezier edges to multi-row descendants or across dense branches may visually pass across canvas lanes or upper sibling cards; card-on-card collision prevention is the strictly guaranteed invariant.
+- **Collision-Free Separate Lanes for Ambiguous and Isolated Nodes**:
+  - Ambiguous profiles (multiple accounts sharing candidate parent prefix) are arranged in their own dedicated lane below all connected trees (`ambiguousStartY >= treesBottomY + LANE_GAP`).
+  - Isolated/unlinked accounts (no edges and unambiguous) are arranged in their own dedicated lane below ambiguous nodes (`isolatedStartY >= ambiguousBottomY + LANE_GAP`).
+  - Strict determinism: all components, trees, roots, and lanes are sorted lexicographically by immutable node ID, guaranteeing identical `(x, y)` coordinates regardless of input array interleaving.
+- **Card Bounds & CSS Truncation / Wrapping**:
+  - Node card container has fixed/bounded dimensions (`width: 240px; max-width: 240px; min-height: 150px; max-height: 240px; box-sizing: border-box;`) matching exported geometry constants `LAYOUT_CONFIG.NODE_WIDTH: 240` and `LAYOUT_CONFIG.NODE_HEIGHT: 240` (`MIN_NODE_HEIGHT: 150`).
+  - Long physical filenames, masked emails, and prefixes truncate/wrap cleanly with ellipsis and accessible tooltips.
+  - Cards enforce controlled internal scrolling (`overflow-y: auto; overflow-x: hidden;`) so that even during active inline editing with error messages, buttons and validation text remain completely accessible and never clipped or pushing past card bounds.
+  - Input controls, action buttons, and error messages stay strictly within node bounds with `nodrag` and `nopan` classes.
+- **Manual Drag Position Preservation & Explicit Auto Arrange**:
+  - Canvas node dragging remains fully enabled; dragged coordinates update React Flow state and are 100% preserved across ordinary prefix edits, connections, disconnections, and component rerenders.
+  - Optional toolbar action **Auto Arrange** (`btn-auto-arrange`, imperative `autoArrange()`) allows users to deterministically re-align nodes to their topology layout without altering prefixes, dirty states, or node IDs.
+
 ## Development & Verification Commands
 
 ```bash

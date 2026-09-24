@@ -536,6 +536,17 @@ const ProfileGraph = forwardRef(function ProfileGraph(
     return true;
   }, [nodes, safeInitialNodes, safeInitialEdges]);
 
+  /**
+   * Deterministically arranges nodes by topology hierarchy.
+   * Preserves manual node edits, dirty flags, and IDs.
+   */
+  const handleAutoArrange = useCallback(() => {
+    dispatch({ type: 'AUTO_ARRANGE' });
+    if (typeof onGraphChange === 'function') {
+      onGraphChange();
+    }
+  }, [onGraphChange]);
+
   // Expose imperative handle for direct programmatic testing
   useImperativeHandle(
     ref,
@@ -558,10 +569,14 @@ const ProfileGraph = forwardRef(function ProfileGraph(
       },
       getNodes: () => nodes,
       getEdges: () => edges,
+      onNodesChange: (changes) => onNodesChange(changes),
+      onEdgesChange: (changes) => onEdgesChange(changes),
       isDirty: () => nodes.some((n) => Boolean(n.data?.isDirty)),
       isSaving: () => Boolean(isSavingRef.current),
       save: () => handleSaveChanges(),
       getSaveState: () => saveState,
+      autoArrange: () => handleAutoArrange(),
+      arrange: () => handleAutoArrange(),
       reset: (force = false) => {
         if (isSavingRef.current) {
           return false; // Prevent reset during active save
@@ -594,6 +609,9 @@ const ProfileGraph = forwardRef(function ProfileGraph(
       edges,
       safeInitialNodes,
       safeInitialEdges,
+      handleAutoArrange,
+      onNodesChange,
+      onEdgesChange,
     ]
   );
 
@@ -699,6 +717,16 @@ const ProfileGraph = forwardRef(function ProfileGraph(
               </button>
             </>
           )}
+
+          <button
+            type="button"
+            onClick={handleAutoArrange}
+            className="btn btn-outline"
+            data-testid="btn-auto-arrange"
+            title="Arrange nodes deterministically by topology hierarchy"
+          >
+            Auto Arrange
+          </button>
 
           <button
             type="button"

@@ -471,4 +471,109 @@ describe('ProfileNode Component - Inline Editing & Dirty State', () => {
       ).toBeTruthy();
     });
   });
+
+  describe('VP-8 Card Bounds & CSS Truncation/Wrapping', () => {
+    it('renders bounded node card with proper CSS classes for long filenames, badges, and emails', () => {
+      const longFileName = 'antigravity-very-long-account-production-backup-2025.json';
+      const longEmail = 'administrator-primary-account-engineering@subdomain.antigravity.internal';
+      renderInProvider(
+        <ProfileNode
+          id={longFileName}
+          data={{
+            fileName: longFileName,
+            prefix: 'agy_production_pool_northamerica_east_region_01',
+            label: 'agy_production_pool_northamerica_east_region_01',
+            isRoot: true,
+            isDirty: true,
+            accountType: 'antigravity',
+            maskedEmail: 'adm...ing@subdomain.antigravity.internal',
+            outgoingCount: 3,
+          }}
+          isConnectable={true}
+        />
+      );
+
+      // Node card container has .profile-node and .profile-node-root
+      const card = screen.getByTestId(`profile-node-${longFileName}`);
+      expect(card.classList.contains('profile-node')).toBe(true);
+      expect(card.classList.contains('profile-node-root')).toBe(true);
+      expect(card.classList.contains('profile-node-dirty')).toBe(true);
+
+      // Node ID renders with masked display text and accessible full title tooltip
+      const idEl = card.querySelector('.profile-node-id');
+      expect(idEl).toBeTruthy();
+      expect(idEl.getAttribute('title')).toBe(longFileName);
+
+      // Email renders with .profile-node-email class and title tooltip
+      const emailEl = screen.getByTestId(`profile-node-email-${longFileName}`);
+      expect(emailEl.classList.contains('profile-node-email')).toBe(true);
+      expect(emailEl.getAttribute('title')).toBe('adm...ing@subdomain.antigravity.internal');
+
+      // Prefix renders with .profile-node-prefix class and title tooltip
+      const prefixEl = screen.getByTestId(`profile-node-prefix-${longFileName}`);
+      expect(prefixEl.classList.contains('profile-node-prefix')).toBe(true);
+      expect(prefixEl.getAttribute('title')).toBe('agy_production_pool_northamerica_east_region_01');
+
+      // Badges container renders with wrapped badge classes
+      const badgesContainer = card.querySelector('.profile-node-badges');
+      expect(badgesContainer).toBeTruthy();
+      expect(screen.getByTestId(`badge-dirty-${longFileName}`)).toBeTruthy();
+      expect(screen.getByTestId(`badge-type-${longFileName}`)).toBeTruthy();
+    });
+
+    it('renders ambiguous parent notice in bounded footer with title tooltip', () => {
+      const ambigData = {
+        parentPrefix: 'agy_shared',
+        candidateCount: 2,
+        candidateNames: ['parent_a.json', 'parent_b.json'],
+      };
+      renderInProvider(
+        <ProfileNode
+          id="child_ambig.json"
+          data={{
+            fileName: 'child_ambig.json',
+            prefix: 'agy_shared_1',
+            label: 'agy_shared_1',
+            isRoot: false,
+            ambiguousParent: ambigData,
+          }}
+          isConnectable={true}
+        />
+      );
+
+      const notice = screen.getByTestId('ambiguity-notice-child_ambig.json');
+      expect(notice.classList.contains('profile-node-ambiguous-footer')).toBe(true);
+
+      const subtext = notice.querySelector('.profile-node-subtext');
+      expect(subtext).toBeTruthy();
+      expect(subtext.getAttribute('title')).toContain('parent_a.json, parent_b.json');
+    });
+
+    it('renders input and error elements with nodrag and nopan classes', () => {
+      renderInProvider(
+        <ProfileNode
+          id="node_edit_test"
+          data={{ prefix: 'test_prefix', label: 'test_prefix', isRoot: true }}
+          isConnectable={true}
+        />
+      );
+
+      const editBtn = screen.getByTestId('btn-edit-prefix-node_edit_test');
+      fireEvent.click(editBtn);
+
+      const input = screen.getByTestId('input-prefix-node_edit_test');
+      expect(input.classList.contains('nodrag')).toBe(true);
+      expect(input.classList.contains('nopan')).toBe(true);
+
+      // Trigger error
+      fireEvent.change(input, { target: { value: 'invalid prefix!' } });
+      const saveBtn = screen.getByTestId('btn-save-prefix-node_edit_test');
+      fireEvent.click(saveBtn);
+
+      const errorEl = screen.getByTestId('validation-error-node_edit_test');
+      expect(errorEl.classList.contains('profile-node-error')).toBe(true);
+      expect(errorEl.classList.contains('nodrag')).toBe(true);
+      expect(errorEl.classList.contains('nopan')).toBe(true);
+    });
+  });
 });

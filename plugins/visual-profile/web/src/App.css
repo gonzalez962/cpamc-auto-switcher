@@ -268,7 +268,11 @@ body, html {
 
 /* Custom Profile Node */
 .profile-node {
-  min-width: 150px;
+  width: 240px;
+  max-width: 240px;
+  min-height: 150px;
+  max-height: 240px;
+  box-sizing: border-box;
   padding: 10px 14px;
   background-color: var(--bg-surface);
   border: 1.5px solid var(--border-color);
@@ -276,6 +280,17 @@ body, html {
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
   transition: border-color 0.2s, box-shadow 0.2s;
   color: var(--text-primary);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.profile-node::-webkit-scrollbar {
+  width: 4px;
+}
+
+.profile-node::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
 }
 
 .profile-node-root {
@@ -291,8 +306,9 @@ body, html {
 .profile-node-header {
   display: flex;
   justify-content: space-between;
-  align-items: center;
+  align-items: flex-start;
   margin-bottom: 6px;
+  gap: 6px;
 }
 
 .profile-badge {
@@ -315,10 +331,24 @@ body, html {
   border: 1px solid rgba(56, 139, 253, 0.4);
 }
 
+.profile-node-badges {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  max-width: 140px;
+}
+
 .profile-node-id {
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 90px;
+  text-align: right;
+  flex-shrink: 1;
 }
 
 .profile-node-body {
@@ -331,6 +361,10 @@ body, html {
   font-weight: 600;
   color: var(--text-primary);
   word-break: break-all;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1;
 }
 
 .profile-node-footer {
@@ -363,12 +397,6 @@ body, html {
 .profile-node-dirty {
   border-color: #d29922;
   box-shadow: 0 0 10px rgba(210, 153, 34, 0.25);
-}
-
-.profile-node-badges {
-  display: flex;
-  align-items: center;
-  gap: 4px;
 }
 
 .badge-dirty {
@@ -416,6 +444,7 @@ body, html {
   display: flex;
   align-items: center;
   gap: 4px;
+  flex-shrink: 0;
 }
 
 .btn-disconnect-node {
@@ -442,6 +471,15 @@ body, html {
 
 .profile-node-ambiguous-footer {
   border-top: 1px dashed rgba(219, 109, 40, 0.4);
+  margin-top: 6px;
+  padding-top: 4px;
+}
+
+.profile-node-ambiguous-footer .profile-node-subtext {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .badge-live-auth {
@@ -468,6 +506,7 @@ body, html {
   align-items: center;
   justify-content: space-between;
   gap: 6px;
+  width: 100%;
 }
 
 .btn-edit-prefix {
@@ -496,10 +535,12 @@ body, html {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  width: 100%;
 }
 
 .profile-node-input {
   width: 100%;
+  box-sizing: border-box;
   padding: 4px 6px;
   background-color: var(--bg-app);
   border: 1px solid var(--border-active);
@@ -548,6 +589,8 @@ body, html {
   font-size: 10px;
   color: #f85149;
   line-height: 1.2;
+  word-break: break-word;
+  margin-top: 4px;
 }
 
 /* Auth / Loading State Boxes */

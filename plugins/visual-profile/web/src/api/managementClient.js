@@ -12,6 +12,8 @@
  * - Graph construction with immutable exact auth-file name IDs, strictly avoiding credential keys in state.
  */
 
+import { computeGraphLayout } from '../graph/layout';
+
 const SECRET_SALT = 'cli-proxy-api-webui::secure-storage';
 const ENC_PREFIX = 'enc::v1::';
 const EMAIL_REGEX = /[a-zA-Z0-9._%+]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
@@ -623,7 +625,7 @@ export function buildGraphFromAuthFiles(authFiles = []) {
   });
 
   // Build nodes with strictly whitelisted non-credential fields
-  const nodes = cleanFiles.map((file, idx) => {
+  const rawNodes = cleanFiles.map((file) => {
     const fileName = file.name;
     const prefix = file.prefix;
     const isChild = childNodeIds.has(fileName);
@@ -632,18 +634,10 @@ export function buildGraphFromAuthFiles(authFiles = []) {
     const accountType = (file.type || file.provider || '').trim().toLowerCase();
     const maskedEmail = extractSafeMaskedEmail(file.email, fileName);
 
-    // Layout in grid: roots on top rows, children on lower rows
-    const col = idx % 4;
-    const row = Math.floor(idx / 4);
-    const position = {
-      x: 100 + col * 240,
-      y: isRoot ? 80 + row * 160 : 280 + row * 160,
-    };
-
     return {
       id: fileName, // Immutable exact auth-file name
       type: 'profile',
-      position,
+      position: { x: 0, y: 0 },
       data: {
         fileName,
         prefix,
@@ -660,6 +654,9 @@ export function buildGraphFromAuthFiles(authFiles = []) {
       },
     };
   });
+
+  // Deterministic topology-aware layout: roots above descendants, collision-free separate lanes
+  const nodes = computeGraphLayout(rawNodes, edges);
 
   return { nodes, edges };
 }

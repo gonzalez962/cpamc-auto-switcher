@@ -1788,4 +1788,119 @@ describe('ProfileGraph Component and onConnect Integration', () => {
       expect(screen.queryByTestId('graph-feedback-banner')).toBeNull();
     });
   });
+
+  describe('VP-8 Topology Layout, Drag Position Preservation & Auto Arrange', () => {
+    it('renders Auto Arrange button in toolbar', () => {
+      render(<ProfileGraph />);
+      const arrangeBtn = screen.getByTestId('btn-auto-arrange');
+      expect(arrangeBtn).toBeTruthy();
+      expect(arrangeBtn.textContent).toContain('Auto Arrange');
+    });
+
+    it('ensures node dragging is not disabled on graph nodes', () => {
+      const graphRef = React.createRef();
+      render(<ProfileGraph ref={graphRef} />);
+
+      const nodes = graphRef.current.getNodes();
+      expect(nodes.length).toBeGreaterThan(0);
+      // No node has draggable explicitly disabled
+      nodes.forEach((n) => {
+        expect(n.draggable).not.toBe(false);
+      });
+    });
+
+    it('preserves manual dragged positions across ordinary edits, connects, and disconnects', () => {
+      const graphRef = React.createRef();
+      render(<ProfileGraph ref={graphRef} />);
+
+      // Verify initial position of p1
+      const initialP1 = graphRef.current.getNodes().find((n) => n.id === 'p1');
+      expect(initialP1).toBeTruthy();
+
+      // Simulate dragging p1 to custom coordinates (777, 888)
+      act(() => {
+        graphRef.current.onNodesChange([
+          {
+            type: 'position',
+            id: 'p1',
+            position: { x: 777, y: 888 },
+          },
+        ]);
+      });
+
+      // Verify dragged position took effect
+      const draggedP1 = graphRef.current.getNodes().find((n) => n.id === 'p1');
+      expect(draggedP1.position).toEqual({ x: 777, y: 888 });
+
+      // 1. Perform an inline prefix edit on p1
+      act(() => {
+        graphRef.current.updateNodePrefix('p1', 'agy_p1_custom');
+      });
+
+      // Verify dragged coordinates (777, 888) are 100% PRESERVED after edit
+      const editedP1 = graphRef.current.getNodes().find((n) => n.id === 'p1');
+      expect(editedP1.position).toEqual({ x: 777, y: 888 });
+      expect(editedP1.data.prefix).toBe('agy_p1_custom');
+
+      // 2. Perform a connect operation from p1 to c1
+      act(() => {
+        graphRef.current.connect({ source: 'p1', target: 'c1' });
+      });
+
+      // Verify dragged coordinates remain PRESERVED after connect
+      const connectedP1 = graphRef.current.getNodes().find((n) => n.id === 'p1');
+      expect(connectedP1.position).toEqual({ x: 777, y: 888 });
+
+      // 3. Disconnect c1 from p1
+      act(() => {
+        graphRef.current.disconnectNode('c1');
+      });
+
+      // Verify dragged coordinates remain PRESERVED after disconnect
+      const disconnectedP1 = graphRef.current.getNodes().find((n) => n.id === 'p1');
+      expect(disconnectedP1.position).toEqual({ x: 777, y: 888 });
+    });
+
+    it('rearranges nodes via explicit Auto Arrange action without secretly altering prefixes or node IDs', () => {
+      const graphRef = React.createRef();
+      render(<ProfileGraph ref={graphRef} />);
+
+      // Connect p1 to c1 and drag c1 far away
+      act(() => {
+        graphRef.current.connect({ source: 'p1', target: 'c1' });
+        graphRef.current.onNodesChange([
+          {
+            type: 'position',
+            id: 'c1',
+            position: { x: 2000, y: 2000 },
+          },
+        ]);
+      });
+
+      expect(graphRef.current.getNodes().find((n) => n.id === 'c1').position).toEqual({
+        x: 2000,
+        y: 2000,
+      });
+
+      // Click Auto Arrange button
+      const arrangeBtn = screen.getByTestId('btn-auto-arrange');
+      act(() => {
+        fireEvent.click(arrangeBtn);
+      });
+
+      const nodesAfter = graphRef.current.getNodes();
+      const p1After = nodesAfter.find((n) => n.id === 'p1');
+      const c1After = nodesAfter.find((n) => n.id === 'c1');
+
+      // Positions are rearranged into topology hierarchy: root p1 above descendant c1
+      expect(p1After.position.y).toBeLessThan(c1After.position.y);
+      expect(c1After.position).not.toEqual({ x: 2000, y: 2000 });
+
+      // Business prefixes and node IDs are strictly preserved
+      expect(p1After.id).toBe('p1');
+      expect(p1After.data.prefix).toBe('agy_p1');
+      expect(c1After.id).toBe('c1');
+      expect(c1After.data.prefix).toBe('agy_p1_1');
+    });
+  });
 });
