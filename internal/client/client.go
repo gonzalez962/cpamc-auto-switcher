@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -93,8 +94,7 @@ func (c *Client) ListAuthFiles(ctx context.Context) ([]AuthFileEntry, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("list auth files failed (%d): %s", resp.StatusCode, string(body))
+		return nil, &ManagementAPIError{StatusCode: resp.StatusCode}
 	}
 
 	var res listAuthFilesResponse
@@ -129,8 +129,10 @@ func (c *Client) GetAuthFileDetails(ctx context.Context, name string) (AuthFileM
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return meta, fmt.Errorf("download auth file failed (%d): %s", resp.StatusCode, string(body))
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return meta, &ManagementAPIError{StatusCode: resp.StatusCode}
+		}
+		return meta, &AuthFileError{StatusCode: resp.StatusCode}
 	}
 
 	var rawMap map[string]any
@@ -184,6 +186,41 @@ type APICallResponse struct {
 	Body       any                 `json:"body"`
 }
 
+// QuotaQueryError indicates the per-account upstream quota endpoint failed.
+type QuotaQueryError struct{ StatusCode int }
+type ManagementAPIError struct{ StatusCode int }
+
+// AccountQuotaError marks the narrowly scoped outer 400 response from the quota api-call endpoint.
+type AccountQuotaError struct{ StatusCode int }
+
+func (e *AccountQuotaError) Error() string {
+	return fmt.Sprintf("account quota request rejected by management API (%d)", e.StatusCode)
+}
+
+type TransportError struct{ Err error }
+
+func (e *TransportError) Error() string { return "quota transport unavailable" }
+func (e *TransportError) Unwrap() error { return e.Err }
+
+func (e *ManagementAPIError) Error() string {
+	return fmt.Sprintf("management API failed (%d)", e.StatusCode)
+}
+
+type AuthFileError struct{ StatusCode int }
+type AccountAuthError struct{ StatusCode int }
+
+func (e *AccountAuthError) Error() string {
+	return fmt.Sprintf("account authentication failed (%d)", e.StatusCode)
+}
+
+func (e *AuthFileError) Error() string {
+	return fmt.Sprintf("auth file request failed (%d)", e.StatusCode)
+}
+
+func (e *QuotaQueryError) Error() string {
+	return fmt.Sprintf("account quota endpoint returned %d", e.StatusCode)
+}
+
 // doAPICall sends a request through the management api-call proxy and unwraps the response envelope.
 func (c *Client) doAPICall(ctx context.Context, apiReq APICallRequest) ([]byte, error) {
 	bodyBytes, err := json.Marshal(apiReq)
@@ -201,29 +238,41 @@ func (c *Client) doAPICall(ctx context.Context, apiReq APICallRequest) ([]byte, 
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("execute api-call failed: %w", err)
+		return nil, &TransportError{Err: err}
 	}
 	defer resp.Body.Close()
 
 	respBody, readErr := io.ReadAll(resp.Body)
 	if readErr != nil {
-		return nil, fmt.Errorf("read response body: %w", readErr)
+		return nil, &TransportError{Err: readErr}
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("management api-call returned %d: %s", resp.StatusCode, string(respBody))
+		if resp.StatusCode == http.StatusBadRequest {
+			return nil, &AccountQuotaError{StatusCode: resp.StatusCode}
+		}
+		return nil, &ManagementAPIError{StatusCode: resp.StatusCode}
 	}
 
 	// Parse the management proxy response envelope
 	var apiCallResp APICallResponse
-	if err := json.Unmarshal(respBody, &apiCallResp); err != nil {
-		// If not an envelope, use raw bytes directly
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(respBody, &envelope); err != nil {
+		return nil, &QuotaQueryError{}
+	}
+	if _, isEnvelope := envelope["status_code"]; !isEnvelope {
 		return respBody, nil
+	}
+	if err := json.Unmarshal(respBody, &apiCallResp); err != nil {
+		return nil, &QuotaQueryError{}
 	}
 
 	// Check upstream status code inside the envelope
 	if apiCallResp.StatusCode > 0 && (apiCallResp.StatusCode < 200 || apiCallResp.StatusCode >= 300) {
-		return nil, fmt.Errorf("upstream returned %d: %v", apiCallResp.StatusCode, apiCallResp.Body)
+		if apiCallResp.StatusCode == http.StatusUnauthorized || apiCallResp.StatusCode == http.StatusForbidden {
+			return nil, &AccountAuthError{StatusCode: apiCallResp.StatusCode}
+		}
+		return nil, &QuotaQueryError{StatusCode: apiCallResp.StatusCode}
 	}
 
 	// Extract the actual upstream body
@@ -244,6 +293,8 @@ func (c *Client) doAPICall(ctx context.Context, apiReq APICallRequest) ([]byte, 
 // GetQuotaSummary calls Antigravity's retrieveUserQuotaSummary via the management api-call proxy.
 func (c *Client) GetQuotaSummary(ctx context.Context, authIndex, projectID string) ([]byte, error) {
 	var lastErr error
+	var managementErr error
+	var transportErr error
 
 	for _, endpoint := range AntigravityQuotaEndpoints {
 		payloadData := "{}"
@@ -268,8 +319,21 @@ func (c *Client) GetQuotaSummary(ctx context.Context, authIndex, projectID strin
 			return bytes, nil
 		}
 		lastErr = err
+		var mgmt *ManagementAPIError
+		if errors.As(err, &mgmt) {
+			managementErr = err
+		}
+		var transport *TransportError
+		if errors.As(err, &transport) && transportErr == nil {
+			transportErr = err
+		}
 	}
-
+	if managementErr != nil {
+		return nil, managementErr
+	}
+	if transportErr != nil {
+		return nil, transportErr
+	}
 	return nil, fmt.Errorf("all antigravity quota endpoints failed: %w", lastErr)
 }
 
@@ -332,8 +396,7 @@ func (c *Client) PatchAuthPrefix(ctx context.Context, nameOrID, newPrefix string
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("patch auth prefix failed (%d): %s", resp.StatusCode, string(respBody))
+		return &ManagementAPIError{StatusCode: resp.StatusCode}
 	}
 
 	return nil

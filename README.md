@@ -24,6 +24,10 @@ Standalone Go utility to automatically inspect account quotas on CLIProxyAPI and
   - If an upstream provider returns only the `Weekly` window (or single window), the 5-hour requirement is gracefully omitted and only the available window is evaluated.
 - **Multi-Group Aggregation (Policy 2A)**:
   - When quota responses contain multiple model groups, the worst-case limit (lowest remaining capacity) across all groups is evaluated.
+- **Active-first quota checks**:
+  - Metadata is refreshed on each run to detect external prefix changes. Routine rotation checks query the active account first; reserves in the same provider/profile pool are queried only after the active reaches a rotation threshold.
+  - A known problem active is not queried again; its cache identity is removed and healthy same-provider/profile reserves are evaluated for replacement. Newly detected account-local auth/quota failures follow the same path. `-list` remains an explicit quota view, while `--review` retries recorded problem accounts and can restore cache eligibility after resolution.
+  - Provisionally, an outer HTTP 400 from the per-account quota `api-call` request is treated as account-local so healthy accounts and profiles can continue; other management statuses, transport failures, and discovery/metadata errors remain fatal. Safe typed failure reasons and status codes are stored per account in `state.json`; response bodies and arbitrary error text are not persisted.
 - **Reserve Account Selection (Policy 3B)**:
   - The reserve account with the highest minimum remaining quota across its available windows is selected as the replacement.
 - **Direct Prefix Swap (Policy 4A)**:
@@ -123,6 +127,15 @@ cpamc-auto-switcher -check
 # or filter by provider and profile:
 cpamc-auto-switcher -check -provider antigravity -profile p1
 ```
+
+### Review accounts with quota/authentication failures
+Routine quota checks skip accounts whose individual quota query failed and print one concise hint. Retry every recorded account, regardless of provider/profile filters, without rotating prefixes:
+
+```bash
+cpamc-auto-switcher --review
+```
+
+Successfully parsed quota checks with at least one usable quota window remove accounts from the review list. Missing or disabled accounts remain explicitly marked unresolved until available for review. Review status is stored in the private `state.json` beside the config; service-wide management errors are not treated as individual account failures.
 
 ### Perform Automatic Rotation
 Inspect accounts, fetch live quotas, and perform a prefix swap if limits are exceeded. Evaluates each profile pool independently. A 5-minute cooldown is enforced between quota checks by default:

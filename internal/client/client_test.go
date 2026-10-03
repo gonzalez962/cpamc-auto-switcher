@@ -3,8 +3,10 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -113,6 +115,219 @@ func TestClientPatchAuthPrefix(t *testing.T) {
 	}
 }
 
+func TestAuthFileManagementAuthStatusesAreManagementErrors(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte("private management key detail"))
+		}))
+		cli, _ := New(server.URL, "key")
+		_, err := cli.GetAuthFileDetails(context.Background(), "acct")
+		server.Close()
+		var managementErr *ManagementAPIError
+		if !errors.As(err, &managementErr) || managementErr.StatusCode != status {
+			t.Fatalf("status %d not classified as management auth failure: %v", status, err)
+		}
+		if strings.Contains(err.Error(), "private management key detail") {
+			t.Fatalf("response body leaked: %v", err)
+		}
+	}
+}
+
+func TestManagementAndAuthFileFailuresAreTypedAndRedacted(t *testing.T) {
+	for _, tc := range []struct {
+		name, path string
+		status     int
+	}{
+		{"management api outage", "/v0/management/api-call", http.StatusServiceUnavailable},
+		{"missing account metadata", "/v0/management/auth-files/download", http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte("private response body"))
+			}))
+			defer server.Close()
+			cli, err := New(server.URL, "key")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got error
+			if tc.path == "/v0/management/api-call" {
+				_, got = cli.GetCodexQuotaSummary(context.Background(), "idx", "")
+			} else {
+				_, got = cli.GetAuthFileDetails(context.Background(), "missing")
+			}
+			var typed bool
+			if tc.path == "/v0/management/api-call" {
+				var target *ManagementAPIError
+				typed = errors.As(got, &target)
+			} else {
+				var target *AuthFileError
+				typed = errors.As(got, &target)
+			}
+			if got == nil || !typed {
+				t.Fatalf("expected typed error, got %v", got)
+			}
+			if strings.Contains(got.Error(), "private response body") {
+				t.Fatalf("sensitive body exposed: %v", got)
+			}
+		})
+	}
+}
+
+type failingBody struct{}
+
+func (failingBody) Read([]byte) (int, error) { return 0, errors.New("private body read detail") }
+func (failingBody) Close() error             { return nil }
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+func TestQuotaResponseBodyReadFailureIsTypedTransportError(t *testing.T) {
+	cli, err := New("http://proxy.invalid", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli.httpClient.Transport = roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: failingBody{}}, nil
+	})
+	_, err = cli.GetCodexQuotaSummary(context.Background(), "idx", "")
+	var transportErr *TransportError
+	if !errors.As(err, &transportErr) {
+		t.Fatalf("body read failure should be typed as transport failure: %v", err)
+	}
+	if strings.Contains(err.Error(), "private body read detail") {
+		t.Fatalf("body read detail leaked: %v", err)
+	}
+}
+
+func TestAntigravityFallbackPreservesManagementFailurePrecedence(t *testing.T) {
+	original := AntigravityQuotaEndpoints
+	AntigravityQuotaEndpoints = []string{"https://one.invalid", "https://two.invalid", "https://three.invalid"}
+	defer func() { AntigravityQuotaEndpoints = original }()
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		switch calls {
+		case 1:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("service secret"))
+		case 2:
+			_, _ = w.Write([]byte(`{"status_code":401,"body":"account detail"}`))
+		default:
+			_, _ = w.Write([]byte(`{"status_code":500,"body":"account detail"}`))
+		}
+	}))
+	defer server.Close()
+	cli, err := New(server.URL, "key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = cli.GetQuotaSummary(context.Background(), "idx", "")
+	var managementErr *ManagementAPIError
+	if !errors.As(err, &managementErr) {
+		t.Fatalf("management failure was masked by fallback error: %v", err)
+	}
+	if strings.Contains(err.Error(), "service secret") || strings.Contains(err.Error(), "account detail") {
+		t.Fatalf("sensitive fallback response exposed: %v", err)
+	}
+}
+
+func TestAntigravityFallbackPreservesTransportFailureOverAccountLocalFailure(t *testing.T) {
+	original := AntigravityQuotaEndpoints
+	AntigravityQuotaEndpoints = []string{"https://one.invalid", "https://two.invalid", "https://three.invalid"}
+	defer func() { AntigravityQuotaEndpoints = original }()
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			h, _ := w.(http.Hijacker)
+			conn, _, err := h.Hijack()
+			if err == nil {
+				_ = conn.Close()
+			}
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer server.Close()
+	cli, _ := New(server.URL, "key")
+	_, err := cli.GetQuotaSummary(context.Background(), "idx", "")
+	var transportErr *TransportError
+	if !errors.As(err, &transportErr) {
+		t.Fatalf("transport outage masked by later account error: %v", err)
+	}
+}
+
+func TestClientListAccountsTransportFailureIsReturned(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) }))
+	defer server.Close()
+	cli, _ := New(server.URL, "")
+	_, err := cli.ListAuthFiles(context.Background())
+	var mgmt *ManagementAPIError
+	if !errors.As(err, &mgmt) || mgmt.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected typed discovery failure, got %v", err)
+	}
+}
+
+func TestManagementQuotaBadRequestIsTypedSeparatelyFromUpstreamBadRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		outer bool
+	}{
+		{name: "outer management response", outer: true},
+		{name: "upstream envelope"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.outer {
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = w.Write([]byte("sensitive management response"))
+					return
+				}
+				_, _ = w.Write([]byte(`{"status_code":400,"body":"sensitive upstream response"}`))
+			}))
+			defer server.Close()
+			cli, _ := New(server.URL, "key")
+			_, err := cli.GetCodexQuotaSummary(context.Background(), "idx", "")
+			var accountErr *AccountQuotaError
+			var queryErr *QuotaQueryError
+			if tc.outer {
+				if !errors.As(err, &accountErr) || accountErr.StatusCode != http.StatusBadRequest {
+					t.Fatalf("outer 400 should be account-local typed error: %v", err)
+				}
+			} else if !errors.As(err, &queryErr) || errors.As(err, &accountErr) {
+				t.Fatalf("upstream 400 should remain a quota query error: %v", err)
+			}
+			if strings.Contains(err.Error(), "sensitive") {
+				t.Fatalf("response body leaked: %v", err)
+			}
+		})
+	}
+}
+
+func TestQuotaQueryErrorPreservesUpstreamStatusWithoutBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status_code":429,"body":"sensitive response"}`))
+	}))
+	defer server.Close()
+	cli, err := New(server.URL, "key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = cli.GetCodexQuotaSummary(context.Background(), "idx", "")
+	var queryErr *QuotaQueryError
+	if !errors.As(err, &queryErr) || queryErr.StatusCode != 429 {
+		t.Fatalf("expected structured status 429, got %#v", err)
+	}
+	if strings.Contains(err.Error(), "sensitive response") {
+		t.Fatalf("error exposed response body: %v", err)
+	}
+}
+
 func TestClientGetCodexQuotaSummary(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v0/management/api-call" {
@@ -138,7 +353,7 @@ func TestClientGetCodexQuotaSummary(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status_code": 200,
-			"body": `{"rate_limit":{"primary_window":{"used_percent":15.0}}}`,
+			"body":        `{"rate_limit":{"primary_window":{"used_percent":15.0}}}`,
 		})
 	}))
 	defer server.Close()
