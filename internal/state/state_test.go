@@ -1,7 +1,9 @@
 package state
 
 import (
+	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -34,6 +36,11 @@ func TestStateSaveAndLoad(t *testing.T) {
 	if err := original.Save(statePath); err != nil {
 		t.Fatalf("failed to save state: %v", err)
 	}
+	if info, err := os.Stat(statePath); err != nil {
+		t.Fatal(err)
+	} else if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+		t.Fatalf("state file mode = %o, want 600", info.Mode().Perm())
+	}
 
 	loaded, err := Load(statePath)
 	if err != nil {
@@ -42,6 +49,73 @@ func TestStateSaveAndLoad(t *testing.T) {
 
 	if !loaded.LastCheck.Equal(now) {
 		t.Fatalf("expected LastCheck %v, got %v", now, loaded.LastCheck)
+	}
+}
+
+func TestProblemAccountsPersistAndReplaceByIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	now := time.Now().UTC().Truncate(time.Second)
+	s := &State{LastCheck: now}
+	s.RecordProblem("codex", "stable-id", "quota query failed")
+	s.RecordProblem("codex", "stable-id", "account authentication failed")
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.LastCheck.Equal(now) || len(loaded.Problems) != 1 || loaded.Problems[0].Reason != "account authentication failed" {
+		t.Fatalf("unexpected persisted state: %+v", loaded)
+	}
+	loaded.ResolveProblem("codex", "stable-id")
+	if len(loaded.Problems) != 0 {
+		t.Fatalf("expected problem resolved, got %+v", loaded.Problems)
+	}
+}
+
+func TestProblemIdentityNeverEntersActiveCache(t *testing.T) {
+	s := &State{ActiveAccounts: map[string]string{activeKey("codex", ""): "bad"}}
+	s.RecordProblem("CODEX", "bad", "failed")
+	s.SetActive("codex", "", "bad")
+	s.SyncActives("codex", map[string]string{"": "bad", "p1": "good"})
+	if got := s.Active("codex", ""); got != "" {
+		t.Fatalf("problem identity remained active: %q", got)
+	}
+	if got := s.Active("codex", "p1"); got != "good" {
+		t.Fatalf("healthy identity lost: %q", got)
+	}
+	s.ResolveProblem("codex", "bad")
+	s.SetActive("codex", "", "bad")
+	if got := s.Active("codex", ""); got != "bad" {
+		t.Fatalf("resolved identity could not be recached: %q", got)
+	}
+}
+
+func TestActiveCacheRoundTripAndLegacyState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	legacy := `{"last_check":"2026-01-01T00:00:00Z"}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded.SetActive("codex", "", "stable-account")
+	loaded.SetActive("codex", "p1", "profile-account")
+	if err := loaded.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.Active("codex", ""); got != "stable-account" {
+		t.Fatalf("default active identity = %q", got)
+	}
+	if got := reloaded.Active("codex", "p1"); got != "profile-account" {
+		t.Fatalf("profile active identity = %q", got)
 	}
 }
 

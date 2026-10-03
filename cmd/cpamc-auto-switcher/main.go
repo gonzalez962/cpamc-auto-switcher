@@ -64,10 +64,18 @@ func abbreviateEmail(email string) string {
 	return string(runes[:3]) + "..." + string(runes[len(runes)-3:]) + domain
 }
 
+func persistRunState(st *state.State, path string, success bool) error {
+	if success {
+		st.LastCheck = time.Now().UTC()
+	}
+	return st.Save(path)
+}
+
 func main() {
 	configPathFlag := flag.String("config", "", "Path to configuration file (default: ~/.local/share/cpamc-auto-switcher/config.json)")
 	initFlag := flag.Bool("init", false, "Initialize or update credentials configuration interactively")
 	listFlag := flag.Bool("list", false, "List all accounts, their prefix, and current quota usage")
+	reviewFlag := flag.Bool("review", false, "Retry quota checks for accounts with recorded quota/auth failures")
 	providerFlag := flag.String("provider", "", "Target provider to evaluate (antigravity, codex, or all; default from config or 'all')")
 	profileFlag := flag.String("profile", "", "Filter accounts or evaluation by profile (e.g. 'p1', or 'default' for unprofiled)")
 	switchFlag := flag.String("switch", "", "Manually promote specified account (by prefix, ID, filename, or email) to active")
@@ -139,26 +147,57 @@ func main() {
 	// Load runtime state (tracks last check time for cooldown)
 	statePath, errStatePath := state.DefaultStatePath(loadedPath)
 	var appState *state.State
-	if errStatePath == nil {
-		var errLoadState error
-		appState, errLoadState = state.Load(statePath)
-		if errLoadState != nil && *verboseFlag {
-			fmt.Fprintf(os.Stderr, "[WARN] Could not load state from %s: %v\n", statePath, errLoadState)
-		}
-	} else {
-		appState = &state.State{}
+	if errStatePath != nil {
+		fmt.Fprintf(os.Stderr, "Failed to resolve state path: %v\n", errStatePath)
+		os.Exit(1)
+	}
+	var errLoadState error
+	appState, errLoadState = state.Load(statePath)
+	if errLoadState != nil {
+		fmt.Fprintf(os.Stderr, "Could not load state from %s: %v\n", statePath, errLoadState)
+		os.Exit(1)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
+	sw.SetState(appState)
 	isDryRun := *checkFlag || *dryRunFlag
+
+	if *reviewFlag {
+		problems, reviewErr := sw.Review(ctx)
+		if reviewErr != nil {
+			fmt.Fprintf(os.Stderr, "Review failed: %v\n", reviewErr)
+			os.Exit(1)
+		}
+		{
+			appState.LastCheck = time.Now().UTC()
+			if err := appState.Save(statePath); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to save review state: %v\n", err)
+				os.Exit(1)
+			}
+		}
+		if len(problems) == 0 {
+			fmt.Println("No accounts need review.")
+			return
+		}
+		fmt.Printf("Accounts still needing review (%d):\n", len(problems))
+		for _, p := range problems {
+			fmt.Printf("- %s (%s) [%s]: %s\n", p.Identity, p.Provider, p.Status, p.Reason)
+		}
+		return
+	}
 
 	// 4. Handle --switch manual promotion command
 	if strings.TrimSpace(*switchFlag) != "" {
 		res, err := sw.SwitchToAccount(ctx, *switchFlag, isDryRun)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Manual switch failed: %v\n", err)
+			saveErr := persistRunState(appState, statePath, false)
+			if saveErr != nil {
+				fmt.Fprintf(os.Stderr, "Manual switch failed: %v; additionally failed to save state: %v\n", err, saveErr)
+			} else {
+				fmt.Fprintf(os.Stderr, "Manual switch failed: %v\n", err)
+			}
 			os.Exit(1)
 		}
 
@@ -166,6 +205,12 @@ func main() {
 			fmt.Printf("[DRY-RUN] %s\n", res.Reason)
 		} else {
 			fmt.Printf("[SWITCHED] %s\n", res.Reason)
+			if res.Rotated {
+				if err := appState.Save(statePath); err != nil {
+					fmt.Fprintf(os.Stderr, "Failed to save switch state: %v\n", err)
+					os.Exit(1)
+				}
+			}
 		}
 		return
 	}
@@ -196,6 +241,14 @@ func main() {
 		}
 
 		if len(accounts) == 0 {
+			if len(appState.ProblemSnapshot()) > 0 {
+				fmt.Println("Accounts with quota/auth failures are skipped; run cpamc-auto-switcher --review to retry them.")
+			}
+			appState.LastCheck = time.Now().UTC()
+			if saveErr := appState.Save(statePath); saveErr != nil {
+				fmt.Fprintf(os.Stderr, "Failed to save state: %v\n", saveErr)
+				os.Exit(1)
+			}
 			if strings.TrimSpace(*profileFlag) != "" {
 				fmt.Printf("No accounts found for provider(s) %v with profile %q\n", cfg.ResolvedProviders(), *profileFlag)
 			} else {
@@ -255,11 +308,15 @@ func main() {
 			)
 		}
 		_ = w.Flush()
+		if len(appState.ProblemSnapshot()) > 0 {
+			fmt.Println("Accounts with quota/auth failures are skipped; run cpamc-auto-switcher --review to retry them.")
+		}
 
 		// Update last check timestamp since quotas were queried
-		if errStatePath == nil {
-			appState.LastCheck = time.Now().UTC()
-			_ = appState.Save(statePath)
+		appState.LastCheck = time.Now().UTC()
+		if saveErr := appState.Save(statePath); saveErr != nil {
+			fmt.Fprintf(os.Stderr, "Failed to save state: %v\n", saveErr)
+			os.Exit(1)
 		}
 		return
 	}
@@ -286,16 +343,18 @@ func main() {
 		res, err = sw.Run(ctx, isDryRun)
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Switcher execution failed: %v\n", err)
+		saveErr := persistRunState(appState, statePath, false)
+		if saveErr != nil {
+			fmt.Fprintf(os.Stderr, "Switcher execution failed: %v; additionally failed to save state: %v\n", err, saveErr)
+		} else {
+			fmt.Fprintf(os.Stderr, "Switcher execution failed: %v\n", err)
+		}
 		os.Exit(1)
 	}
 
-	// Update last check timestamp on successful check
-	if errStatePath == nil {
-		appState.LastCheck = time.Now().UTC()
-		if errSave := appState.Save(statePath); errSave != nil && *verboseFlag {
-			fmt.Fprintf(os.Stderr, "[WARN] Failed to save state to %s: %v\n", statePath, errSave)
-		}
+	if errSave := persistRunState(appState, statePath, true); errSave != nil {
+		fmt.Fprintf(os.Stderr, "Failed to save state to %s: %v\n", statePath, errSave)
+		os.Exit(1)
 	}
 
 	if res.Rotated {
@@ -306,6 +365,9 @@ func main() {
 		}
 	} else {
 		fmt.Println(res.Reason)
+	}
+	if len(appState.ProblemSnapshot()) > 0 {
+		fmt.Println("Accounts with quota/auth failures are skipped; run cpamc-auto-switcher --review to retry them.")
 	}
 }
 

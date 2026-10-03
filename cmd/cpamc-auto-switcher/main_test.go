@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -18,6 +19,103 @@ import (
 	"cpamc-auto-switcher/internal/state"
 	"cpamc-auto-switcher/internal/switcher"
 )
+
+func TestCLIListOuterQuota400PersistsSafeReason(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v0/management/auth-files":
+			_, _ = w.Write([]byte(`{"files":[{"id":"bad","name":"bad.json","auth_index":"bad-index","provider":"codex"},{"id":"good","name":"good.json","auth_index":"good-index","provider":"codex"}]}`))
+		case "/v0/management/auth-files/download":
+			prefix := "codex"
+			if r.URL.Query().Get("name") == "good.json" {
+				prefix = "codex_1"
+			}
+			_, _ = w.Write([]byte(`{"prefix":"` + prefix + `"}`))
+		case "/v0/management/api-call":
+			var req client.APICallRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.AuthIndex == "bad-index" {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte("PRIVATE_SECRET"))
+				return
+			}
+			_, _ = w.Write([]byte(`{"rate_limit":{"primary_window":{"used_percent":10}}}`))
+		}
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	cfg := &config.Config{Endpoint: server.URL, ManagementKey: "test-key", Provider: "codex", FiveHourThreshold: 90, WeeklyThreshold: 95}
+	if _, err := cfg.Save(configPath); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestCLIHelperProcess$")
+	cmd.Env = append(os.Environ(), "CPAM_TEST_CLI=1", "CPAM_TEST_CONFIG="+configPath, "CPAM_TEST_MODE=default")
+	output, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(output), "quota unavailable") || strings.Contains(string(output), "PRIVATE_SECRET") {
+		t.Fatalf("default CLI run should succeed without failover or leaking details: err=%v output=%s", err, output)
+	}
+	statePath := filepath.Join(dir, "state.json")
+	assertPersistedDiagnostic := func(operation, diagnostic string) {
+		t.Helper()
+		data, err := os.ReadFile(statePath)
+		if err != nil {
+			t.Fatalf("read state immediately after %s: %v", operation, err)
+		}
+		if strings.Contains(string(data), "PRIVATE_SECRET") || !strings.Contains(string(data), diagnostic) {
+			t.Fatalf("%s did not persist the expected safe diagnostic: %s", operation, data)
+		}
+	}
+	assertPersistedDiagnostic("forced default run", "account quota request rejected by management API (400)")
+	cmd = exec.Command(os.Args[0], "-test.run=^TestCLIHelperProcess$")
+	cmd.Env = append(os.Environ(), "CPAM_TEST_CLI=1", "CPAM_TEST_CONFIG="+configPath)
+	if output, err = cmd.CombinedOutput(); err != nil {
+		t.Fatalf("--list CLI failed: %v: %s", err, output)
+	}
+	if !strings.Contains(string(output), "good") || !strings.Contains(string(output), "ERR") || strings.Contains(string(output), "PRIVATE_SECRET") {
+		t.Fatalf("unexpected/sensitive CLI output: %s", output)
+	}
+	assertPersistedDiagnostic("--list", "account quota request rejected by management API (400)")
+}
+
+func TestCLIHelperProcess(t *testing.T) {
+	if os.Getenv("CPAM_TEST_CLI") != "1" {
+		return
+	}
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	os.Args = []string{os.Args[0], "--config", os.Getenv("CPAM_TEST_CONFIG")}
+	if os.Getenv("CPAM_TEST_MODE") != "default" {
+		os.Args = append(os.Args, "--list")
+	} else {
+		os.Args = append(os.Args, "--force")
+	}
+	main()
+	os.Exit(0)
+}
+
+func TestPersistRunStateOnPartialFailureKeepsCooldown(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	lastCheck := time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)
+	st := &state.State{LastCheck: lastCheck}
+	st.SetActive("codex", "", "successful-pool")
+	st.RecordProblem("antigravity", "failed-account", "quota query failed")
+	if err := persistRunState(st, path, false); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := state.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.LastCheck.Equal(lastCheck) {
+		t.Fatalf("failed operation advanced cooldown: %s", loaded.LastCheck)
+	}
+	if got := loaded.Active("codex", ""); got != "successful-pool" {
+		t.Fatalf("partial success not persisted: %q", got)
+	}
+	if !loaded.HasProblem("antigravity", "failed-account") {
+		t.Fatal("problem record from completed pool was not persisted")
+	}
+}
 
 func TestCooldownIntegration(t *testing.T) {
 	tempDir := t.TempDir()
@@ -141,6 +239,17 @@ func TestCooldownIntegration(t *testing.T) {
 		t.Fatal("expected 'last_check' key in state file JSON")
 	}
 }
+func TestReviewFlagAccepted(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	review := fs.Bool("review", false, "")
+	if err := fs.Parse([]string{"--review"}); err != nil {
+		t.Fatal(err)
+	}
+	if !*review {
+		t.Fatal("--review flag should activate review mode")
+	}
+}
+
 func TestExtractAccountEmail(t *testing.T) {
 	tests := []struct {
 		id       string
@@ -874,5 +983,3 @@ func TestRunInteractiveInitWithIO_ExistingConfig(t *testing.T) {
 		}
 	})
 }
-
-

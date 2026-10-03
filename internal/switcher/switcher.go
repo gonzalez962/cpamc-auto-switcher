@@ -2,6 +2,7 @@ package switcher
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"cpamc-auto-switcher/internal/client"
 	"cpamc-auto-switcher/internal/config"
 	"cpamc-auto-switcher/internal/quota"
+	"cpamc-auto-switcher/internal/state"
 )
 
 // AccountState represents a discovered credential and its quota metrics.
@@ -36,6 +38,20 @@ type SwitchResult struct {
 type Switcher struct {
 	cfg    *config.Config
 	client *client.Client
+	state  *state.State
+}
+
+func (s *Switcher) SetState(st *state.State) { s.state = st }
+
+func accountIdentity(f client.AuthFileEntry) string {
+	if f.ID != "" {
+		return f.ID
+	}
+	return f.Name
+}
+
+func (s *Switcher) isProblem(f client.AuthFileEntry) bool {
+	return s.state != nil && s.state.HasProblem(f.Provider, accountIdentity(f))
 }
 
 // New creates a new Switcher instance.
@@ -48,7 +64,7 @@ func New(cfg *config.Config, cli *client.Client) *Switcher {
 
 // fetchAccountsConcurrently loads account metadata and quotas in parallel.
 // It guarantees that all asynchronous API calls finish before returning.
-func (s *Switcher) fetchAccountsConcurrently(ctx context.Context, targetProviders []string, skipDisabled bool) ([]AccountState, error) {
+func (s *Switcher) fetchAccountsConcurrently(ctx context.Context, targetProviders []string, skipDisabled bool, review bool, includeKnown bool) ([]AccountState, error) {
 	files, err := s.client.ListAuthFiles(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list auth files: %w", err)
@@ -65,8 +81,17 @@ func (s *Switcher) fetchAccountsConcurrently(ctx context.Context, targetProvider
 		if !providerSet[fProvider] {
 			continue
 		}
+		if review && s.isProblem(f) && f.Disabled {
+			s.state.MarkProblem(f.Provider, accountIdentity(f), "account is disabled; review unresolved", "disabled")
+			continue
+		}
 		if skipDisabled && f.Disabled {
 			continue
+		}
+		if review {
+			if !s.isProblem(f) {
+				continue
+			}
 		}
 		matchingFiles = append(matchingFiles, f)
 	}
@@ -112,6 +137,13 @@ func (s *Switcher) fetchAccountsConcurrently(ctx context.Context, targetProvider
 
 			meta, errMeta := s.client.GetAuthFileDetails(ctx, name)
 			if errMeta != nil {
+				var accountErr *client.AuthFileError
+				if errors.As(errMeta, &accountErr) && accountErr.StatusCode == 404 {
+					mu.Lock()
+					results[idx] = AccountState{Entry: f, QuotaErr: errMeta}
+					mu.Unlock()
+					return
+				}
 				mu.Lock()
 				if firstFatalErr == nil {
 					firstFatalErr = fmt.Errorf("read metadata for %s: %w", name, errMeta)
@@ -132,24 +164,10 @@ func (s *Switcher) fetchAccountsConcurrently(ctx context.Context, targetProvider
 				IsReserve:        parsed.IsReserve,
 			}
 
-			// Fetch quota asynchronously if not disabled
-			if !f.Disabled {
-				accountOrProjectID := f.ProjectID
-				if strings.EqualFold(f.Provider, "codex") && meta.ChatGPTAccountID != "" {
-					accountOrProjectID = meta.ChatGPTAccountID
-				}
-
-				qBytes, errQuota := s.client.GetQuotaSummaryForProvider(ctx, f.Provider, f.AuthIndex, accountOrProjectID)
-				if errQuota != nil {
-					state.QuotaErr = errQuota
-				} else {
-					parsedQuota, errParse := quota.ParseQuotaSummaryForProvider(f.Provider, qBytes)
-					if errParse != nil {
-						state.QuotaErr = errParse
-					} else {
-						state.Quota = parsedQuota
-					}
-				}
+			if review {
+				s.fetchQuota(ctx, &state, true)
+			} else if s.isProblem(f) && !includeKnown {
+				state.QuotaErr = fmt.Errorf("quota review required")
 			}
 
 			mu.Lock()
@@ -161,6 +179,55 @@ func (s *Switcher) fetchAccountsConcurrently(ctx context.Context, targetProvider
 	// Wait until ALL accounts and quotas have finished loading
 	wg.Wait()
 
+	for _, account := range results {
+		var managementErr *client.ManagementAPIError
+		if errors.As(account.QuotaErr, &managementErr) && firstFatalErr == nil {
+			firstFatalErr = managementErr
+		}
+	}
+	if firstFatalErr == nil && s.state != nil {
+		for _, account := range results {
+			if account.Entry.ID == "" && account.Entry.Name == "" {
+				continue
+			}
+			if review {
+				if account.Entry.Disabled {
+					s.state.MarkProblem(account.Entry.Provider, accountIdentity(account.Entry), "account is disabled; review unresolved", "disabled")
+					continue
+				}
+				if account.QuotaErr != nil {
+					reason := "account could not be reviewed; review unresolved"
+					var accountErr *client.AccountQuotaError
+					var authErr *client.AccountAuthError
+					if errors.As(account.QuotaErr, &accountErr) || errors.As(account.QuotaErr, &authErr) {
+						reason = safeQuotaProblemReason(account.QuotaErr)
+					}
+					s.state.MarkProblem(account.Entry.Provider, accountIdentity(account.Entry), reason, "unresolved")
+					continue
+				}
+				if account.Quota == nil || (!account.Quota.HasFiveHour && !account.Quota.HasWeekly) {
+					s.state.MarkProblem(account.Entry.Provider, accountIdentity(account.Entry), "quota response has no usable windows; review unresolved", "unresolved")
+					continue
+				}
+				s.state.ResolveProblem(account.Entry.Provider, accountIdentity(account.Entry))
+				continue
+			}
+			if account.QuotaErr != nil {
+				var queryErr *client.QuotaQueryError
+				var fileErr *client.AuthFileError
+				var managementErr *client.ManagementAPIError
+				var transportErr *client.TransportError
+				var authErr *client.AccountAuthError
+				if errors.As(account.QuotaErr, &authErr) || errors.As(account.QuotaErr, &queryErr) || (account.QuotaErr != nil && !errors.As(account.QuotaErr, &managementErr) && !errors.As(account.QuotaErr, &transportErr) && !errors.As(account.QuotaErr, &fileErr)) {
+					s.state.RecordProblem(account.Entry.Provider, accountIdentity(account.Entry), safeQuotaProblemReason(account.QuotaErr))
+				}
+				if errors.As(account.QuotaErr, &fileErr) && fileErr.StatusCode == 404 {
+					s.state.RecordProblem(account.Entry.Provider, accountIdentity(account.Entry), "account metadata unavailable; review unresolved")
+				}
+			}
+		}
+	}
+
 	if firstFatalErr != nil {
 		return nil, firstFatalErr
 	}
@@ -168,11 +235,107 @@ func (s *Switcher) fetchAccountsConcurrently(ctx context.Context, targetProvider
 	return results, nil
 }
 
+func safeQuotaProblemReason(err error) string {
+	var accountErr *client.AccountQuotaError
+	if errors.As(err, &accountErr) {
+		return fmt.Sprintf("account quota request rejected by management API (%d)", accountErr.StatusCode)
+	}
+	var authErr *client.AccountAuthError
+	if errors.As(err, &authErr) {
+		return fmt.Sprintf("account authentication failed (%d)", authErr.StatusCode)
+	}
+	var queryErr *client.QuotaQueryError
+	if errors.As(err, &queryErr) && queryErr.StatusCode != 0 {
+		return fmt.Sprintf("account quota endpoint returned (%d)", queryErr.StatusCode)
+	}
+	return "quota query failed"
+}
+
+func (s *Switcher) recordQuotaProblem(account *AccountState) {
+	if s.state == nil || account.QuotaErr == nil {
+		return
+	}
+	var managementErr *client.ManagementAPIError
+	var transportErr *client.TransportError
+	if errors.As(account.QuotaErr, &managementErr) || errors.As(account.QuotaErr, &transportErr) {
+		return
+	}
+	s.state.RecordProblem(account.Entry.Provider, accountIdentity(account.Entry), safeQuotaProblemReason(account.QuotaErr))
+}
+
+func (s *Switcher) fetchQuota(ctx context.Context, account *AccountState, includeKnown ...bool) {
+	f := account.Entry
+	if f.Disabled || (s.isProblem(f) && (len(includeKnown) == 0 || !includeKnown[0])) {
+		return
+	}
+	accountOrProjectID := f.ProjectID
+	if strings.EqualFold(f.Provider, "codex") && account.ChatGPTAccountID != "" {
+		accountOrProjectID = account.ChatGPTAccountID
+	}
+	qBytes, err := s.client.GetQuotaSummaryForProvider(ctx, f.Provider, f.AuthIndex, accountOrProjectID)
+	if err != nil {
+		account.QuotaErr = err
+		return
+	}
+	parsed, err := quota.ParseQuotaSummaryForProvider(f.Provider, qBytes)
+	if err != nil {
+		account.QuotaErr = err
+		return
+	}
+	if parsed == nil || (!parsed.HasFiveHour && !parsed.HasWeekly) {
+		account.QuotaErr = fmt.Errorf("quota response has no usable windows")
+		return
+	}
+	account.Quota = parsed
+}
+
 // ListAccounts retrieves and evaluates all accounts for the configured provider(s) along with their quota.
 func (s *Switcher) ListAccounts(ctx context.Context) ([]AccountState, error) {
-	accounts, err := s.fetchAccountsConcurrently(ctx, s.cfg.ResolvedProviders(), false)
+	accounts, err := s.fetchAccountsConcurrently(ctx, s.cfg.ResolvedProviders(), false, false, true)
 	if err != nil {
 		return nil, err
+	}
+	var wg sync.WaitGroup
+	for i := range accounts {
+		wg.Add(1)
+		go func(i int) { defer wg.Done(); s.fetchQuota(ctx, &accounts[i], true) }(i)
+	}
+	wg.Wait()
+	for i := range accounts {
+		if accounts[i].QuotaErr != nil {
+			var managementErr *client.ManagementAPIError
+			if errors.As(accounts[i].QuotaErr, &managementErr) {
+				return nil, managementErr
+			}
+			var transportErr *client.TransportError
+			if errors.As(accounts[i].QuotaErr, &transportErr) {
+				return nil, transportErr
+			}
+			var fileErr *client.AuthFileError
+			if s.state != nil && !errors.As(accounts[i].QuotaErr, &transportErr) && !errors.As(accounts[i].QuotaErr, &fileErr) {
+				s.state.RecordProblem(accounts[i].Entry.Provider, accountIdentity(accounts[i].Entry), safeQuotaProblemReason(accounts[i].QuotaErr))
+			}
+		}
+	}
+	if s.state != nil {
+		observedByProvider := make(map[string]map[string]string)
+		for i := range accounts {
+			provider := accounts[i].Entry.Provider
+			if observedByProvider[provider] == nil {
+				observedByProvider[provider] = make(map[string]string)
+			}
+			if accounts[i].IsActive {
+				observedByProvider[provider][accounts[i].Profile] = accountIdentity(accounts[i].Entry)
+			}
+		}
+		for _, provider := range s.cfg.ResolvedProviders() {
+			if observedByProvider[provider] == nil {
+				observedByProvider[provider] = make(map[string]string)
+			}
+		}
+		for provider, observed := range observedByProvider {
+			s.state.SyncActives(provider, observed)
+		}
 	}
 
 	// Sort accounts: provider alphabetically, profile alphabetically, active first, then by prefix alphabetically, then by ID
@@ -300,6 +463,16 @@ func (s *Switcher) SwitchToAccount(ctx context.Context, targetAccount string, dr
 		}
 	}
 
+	if s.state != nil {
+		identity := ""
+		if activeItem != nil {
+			identity = accountIdentity(activeItem.entry)
+		}
+		s.state.SetActive(provider, targetProfile, identity)
+	}
+	if s.isProblem(targetItem.entry) {
+		return nil, fmt.Errorf("problem account cannot be manually promoted; run cpamc-auto-switcher --review")
+	}
 	if targetItem.meta.Prefix == activePrefix {
 		return &SwitchResult{
 			Rotated:       false,
@@ -349,6 +522,9 @@ func (s *Switcher) SwitchToAccount(ctx context.Context, targetAccount string, dr
 		}
 	}
 
+	if s.state != nil {
+		s.state.SetActive(provider, targetProfile, accountIdentity(targetItem.entry))
+	}
 	return &SwitchResult{
 		Rotated:         true,
 		ActiveAccount:   targetItem.entry.ID,
@@ -364,17 +540,25 @@ func (s *Switcher) SwitchToAccount(ctx context.Context, targetAccount string, dr
 func (s *Switcher) RunProvider(ctx context.Context, provider string, dryRun bool, targetProfiles ...string) (*SwitchResult, error) {
 	baseActive, _ := s.cfg.ConventionForProvider(provider)
 
-	// Step 1: Concurrently load all account metadata and quotas for this provider
-	providerAccounts, err := s.fetchAccountsConcurrently(ctx, []string{provider}, true)
+	// Refresh metadata on every run; current prefixes, not cached identities, are authoritative.
+	providerAccounts, err := s.fetchAccountsConcurrently(ctx, []string{provider}, true, false, false)
 	if err != nil {
 		return nil, fmt.Errorf("fetch accounts for %s: %w", provider, err)
 	}
 
+	// Cache actual active identities observed in metadata, including external changes.
+	observed := make(map[string]string)
+	for i := range providerAccounts {
+		parsed := config.ParsePrefix(providerAccounts[i].Prefix, baseActive)
+		if parsed.Matched && parsed.IsActive {
+			observed[parsed.Profile] = accountIdentity(providerAccounts[i].Entry)
+		}
+	}
+	if s.state != nil {
+		s.state.SyncActives(provider, observed)
+	}
 	if len(providerAccounts) == 0 {
-		return &SwitchResult{
-			Rotated: false,
-			Reason:  fmt.Sprintf("no active accounts found for provider %q", provider),
-		}, nil
+		return &SwitchResult{Rotated: false, Reason: fmt.Sprintf("no active accounts found for provider %q", provider)}, nil
 	}
 
 	// Step 2: Discover all distinct profiles present in the provider's accounts
@@ -461,27 +645,41 @@ func (s *Switcher) RunProvider(ctx context.Context, provider string, dryRun bool
 			continue
 		}
 
-		if active.QuotaErr != nil {
-			return nil, fmt.Errorf("active account quota check failed (%s, profile %q, %s): %w", provider, profile, active.Entry.ID, active.QuotaErr)
+		knownProblem := s.isProblem(active.Entry)
+		if !knownProblem {
+			s.fetchQuota(ctx, active)
 		}
-		if active.Quota == nil {
-			return nil, fmt.Errorf("active account quota missing (%s, profile %q, %s)", provider, profile, active.Entry.ID)
+		if active.QuotaErr != nil {
+			var managementErr *client.ManagementAPIError
+			var transportErr *client.TransportError
+			if errors.As(active.QuotaErr, &managementErr) || errors.As(active.QuotaErr, &transportErr) {
+				return nil, fmt.Errorf("active quota check failed (%s, profile %q, %s): %w", provider, profile, active.Entry.ID, active.QuotaErr)
+			}
+		}
+		problemActive := knownProblem || active.QuotaErr != nil || active.Quota == nil
+		if problemActive && !knownProblem {
+			s.recordQuotaProblem(active)
 		}
 
 		// Step 3: Evaluate threshold condition on active account
 		var quotaInfoParts []string
-		if active.Quota.HasFiveHour && active.Quota.WorstFiveHour != nil {
+		if !problemActive && active.Quota.HasFiveHour && active.Quota.WorstFiveHour != nil {
 			quotaInfoParts = append(quotaInfoParts, fmt.Sprintf("5h %.1f%%", active.Quota.WorstFiveHour.ConsumedPercentage))
 		}
-		if active.Quota.HasWeekly && active.Quota.WorstWeekly != nil {
+		if !problemActive && active.Quota.HasWeekly && active.Quota.WorstWeekly != nil {
 			quotaInfoParts = append(quotaInfoParts, fmt.Sprintf("weekly %.1f%%", active.Quota.WorstWeekly.ConsumedPercentage))
 		}
 		quotaSummaryStr := strings.Join(quotaInfoParts, ", ")
-		if quotaSummaryStr == "" {
+		if quotaSummaryStr == "" && !problemActive {
 			quotaSummaryStr = fmt.Sprintf("%.1f%%", 100.0-active.Quota.MinAvailableRemaining())
 		}
 
-		shouldRotate, reason := active.Quota.ShouldRotate(s.cfg.FiveHourThreshold, s.cfg.WeeklyThreshold)
+		shouldRotate, reason := false, ""
+		if problemActive {
+			shouldRotate, reason = true, "active account is quarantined or quota unavailable"
+		} else {
+			shouldRotate, reason = active.Quota.ShouldRotate(s.cfg.FiveHourThreshold, s.cfg.WeeklyThreshold)
+		}
 		if !shouldRotate {
 			outcomes = append(outcomes, profileOutcome{
 				profile: profile,
@@ -502,9 +700,14 @@ func (s *Switcher) RunProvider(ctx context.Context, provider string, dryRun bool
 			outcomes = append(outcomes, profileOutcome{
 				profile: profile,
 				result: &SwitchResult{
-					Rotated:       false,
-					ActiveAccount: active.Entry.ID,
-					Reason:        noReservesReason,
+					Rotated: false,
+					ActiveAccount: func() string {
+						if problemActive {
+							return ""
+						}
+						return active.Entry.ID
+					}(),
+					Reason: noReservesReason,
 				},
 			})
 			continue
@@ -518,7 +721,16 @@ func (s *Switcher) RunProvider(ctx context.Context, provider string, dryRun bool
 		var eligible []candidate
 
 		for _, res := range reserves {
-			if res.QuotaErr != nil || res.Quota == nil {
+			s.fetchQuota(ctx, res)
+			if res.QuotaErr != nil {
+				var managementErr *client.ManagementAPIError
+				var transportErr *client.TransportError
+				if errors.As(res.QuotaErr, &managementErr) || errors.As(res.QuotaErr, &transportErr) {
+					return nil, fmt.Errorf("reserve quota check failed (%s, profile %q, %s): %w", provider, profile, res.Entry.ID, res.QuotaErr)
+				}
+				s.recordQuotaProblem(res)
+			}
+			if res.QuotaErr != nil || res.Quota == nil || res.Entry.Disabled || s.isProblem(res.Entry) {
 				// Skip reserves with quota errors
 				continue
 			}
@@ -544,9 +756,14 @@ func (s *Switcher) RunProvider(ctx context.Context, provider string, dryRun bool
 			outcomes = append(outcomes, profileOutcome{
 				profile: profile,
 				result: &SwitchResult{
-					Rotated:       false,
-					ActiveAccount: active.Entry.ID,
-					Reason:        allExceededReason,
+					Rotated: false,
+					ActiveAccount: func() string {
+						if problemActive {
+							return ""
+						}
+						return active.Entry.ID
+					}(),
+					Reason: allExceededReason,
 				},
 			})
 			continue
@@ -601,6 +818,9 @@ func (s *Switcher) RunProvider(ctx context.Context, provider string, dryRun bool
 			return nil, fmt.Errorf("failed to demote active %s to %q: %w (rollback attempted)", nameActive, reserveOriginalPrefix, err)
 		}
 
+		if s.state != nil {
+			s.state.SetActive(provider, profile, accountIdentity(bestReserve.Entry))
+		}
 		swapReason := fmt.Sprintf("swapped %s (%s -> %s) and %s (%s -> %s) due to: %s (provider: %s)",
 			bestReserve.Entry.ID, reserveOriginalPrefix, activePrefix,
 			active.Entry.ID, activePrefix, reserveOriginalPrefix,
@@ -651,6 +871,43 @@ func (s *Switcher) RunProvider(ctx context.Context, provider string, dryRun bool
 		SelectedReserve: lastSelectedReserve,
 		Reason:          strings.Join(reasons, " | "),
 	}, nil
+}
+
+// Review retries every recorded account without applying filters or rotating prefixes.
+func (s *Switcher) Review(ctx context.Context) ([]state.ProblemAccount, error) {
+	if s.state == nil {
+		return nil, fmt.Errorf("review state unavailable")
+	}
+	problems := s.state.ProblemSnapshot()
+	providers := make([]string, 0)
+	seen := make(map[string]bool)
+	for _, p := range problems {
+		k := strings.ToLower(p.Provider)
+		if !seen[k] {
+			providers = append(providers, p.Provider)
+			seen[k] = true
+		}
+	}
+	files, err := s.client.ListAuthFiles(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list auth files for review: %w", err)
+	}
+	found := make(map[string]bool)
+	for _, f := range files {
+		if s.state.HasProblem(f.Provider, accountIdentity(f)) {
+			found[strings.ToLower(f.Provider)+"\x00"+accountIdentity(f)] = true
+		}
+	}
+	for _, p := range problems {
+		key := strings.ToLower(p.Provider) + "\x00" + p.Identity
+		if !found[key] {
+			s.state.MarkProblem(p.Provider, p.Identity, "account is missing; review unresolved", "missing")
+		}
+	}
+	if _, err := s.fetchAccountsConcurrently(ctx, providers, false, true, false); err != nil {
+		return nil, err
+	}
+	return s.state.ProblemSnapshot(), nil
 }
 
 // Run executes the evaluation and switching workflow across all resolved providers asynchronously.
